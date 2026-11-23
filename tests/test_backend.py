@@ -39,6 +39,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.sys = tempfile.mkdtemp()
         main.SYS = self.sys
+        main.DEV = "/dev"
         main.STATE = main.State()
         main.STATE.settings["resume_delay"] = 0
         decky.emitted.clear()
@@ -127,6 +128,78 @@ class Intensity(Base):
         put(os.path.join(self.cfg, "rumble_intensity_right"), "0")
         result = main.auto_fix("intensity", (100, 100))
         self.assertTrue(result["ok"] and result["changed"])
+
+
+class McuReset(Base):
+    def setUp(self):
+        super().setUp()
+        put(os.path.join(self.cfg, "mkeys_function"), "combination")
+        base_write = main._write
+
+        def write_with_mcu(path, value):
+            base_write(path, value)
+            if path.endswith("/reset"):  # MCU reboots with factory settings
+                put(os.path.join(self.cfg, "mkeys_function"), "macro")
+                put(os.path.join(self.cfg, "rumble_intensity_left"), "50")
+
+        main._write = write_with_mcu
+        self._wait = main.wait_reenumerated
+        main.wait_reenumerated = lambda devnum, timeout=0: main.find_controller()
+
+    def tearDown(self):
+        main.wait_reenumerated = self._wait
+        super().tearDown()
+
+    def test_reset_puts_settings_back(self):
+        result = main.act_mcu_fix((100, 100), pulse=False)
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(main._read(os.path.join(self.cfg, "mkeys_function")), "combination")
+        self.assertEqual(main._read(os.path.join(self.cfg, "gamepad_mode")), "dinput")
+        self.assertEqual(main.read_intensity(self.cfg), (100, 100))
+        self.assertIn("mkeys_function restored macro -> combination", result["msg"])
+
+    def test_auto_level_mcu_resets_on_wake(self):
+        main.STATE.settings["auto_level"] = "mcu"
+        asyncio.run(main.handle_resume("clock", 30.0))
+        self.assertIn(("bus/usb/devices/3-3/3-3:1.0/0003:0DB0:1902.0001/reset", "1"), self.writes)
+        self.assertEqual(main._read(os.path.join(self.cfg, "mkeys_function")), "combination")
+        self.assertEqual(decky.emitted, [])  # routine reset stays quiet
+
+    def test_failed_auto_reset_notifies(self):
+        main.STATE.settings["auto_level"] = "mcu"
+        os.unlink(os.path.join(self.cfg, "reset"))
+        asyncio.run(main.handle_resume("clock", 30.0))
+        self.assertEqual(len(decky.emitted), 1)
+        self.assertFalse(decky.emitted[0][1])
+
+    def test_missing_reset_attribute_fails_cleanly(self):
+        os.unlink(os.path.join(self.cfg, "reset"))
+        result = main.act_mcu_fix((100, 100), pulse=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.writes, [])
+
+
+class Exposure(Base):
+    def test_detects_unhidden_physical_pad(self):
+        main.DEV = tempfile.mkdtemp()
+        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
+        put(os.path.join(event, "device/capabilities/abs"), "3003f")
+        node = os.path.join(main.DEV, "input/event7")
+        put(node, "")
+        ctrl = main.find_controller()
+        os.chmod(node, 0o660)
+        self.assertTrue(main.pad_exposed(ctrl))
+        os.chmod(node, 0)  # hidden by InputPlumber
+        self.assertFalse(main.pad_exposed(ctrl))
+        os.unlink(node)    # or moved away
+        self.assertFalse(main.pad_exposed(ctrl))
+
+    def test_keyboard_interface_is_not_a_pad(self):
+        main.DEV = tempfile.mkdtemp()
+        event = os.path.join(self.usb, "3-3:1.1/input/input21/event8")
+        put(os.path.join(event, "device/capabilities/abs"), "100000000")
+        put(os.path.join(main.DEV, "input/event8"), "")
+        self.assertFalse(main.pad_exposed(main.find_controller()))
 
 
 class Quirk(Base):

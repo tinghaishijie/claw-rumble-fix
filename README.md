@@ -5,10 +5,12 @@ Extreme, board `MS-1T8K`) running SteamOS. It targets one problem: rumble
 disappears after a number of suspend/resume cycles and, until now, only an EC
 reset (holding the power button for ~25 s) brought it back.
 
-> Status: built and unit-tested against a simulated sysfs tree. **Not yet
-> confirmed on real hardware.** The root cause of the rumble loss is not
-> publicly established, so the plugin ships several recovery strategies plus
-> the tooling to find out which one works on your device.
+> Status: on one MSI Claw A8 the rumble loss was reproduced and **only the
+> controller MCU reset (step 6) brought rumble back**; rewriting the intensity,
+> re-sending the gamepad mode, USB resets and restarting InputPlumber did not.
+> That reset is what the plugin now automates. The automatic after-wake path
+> is unit-tested against a simulated sysfs tree but has not been confirmed on
+> hardware yet, and the underlying MCU bug is still unexplained.
 
 ## What it does
 
@@ -20,6 +22,10 @@ reset (holding the power button for ~25 s) brought it back.
     cause no writes.
   - *Re-send gamepad mode* - makes the controller re-enumerate on USB.
   - *USB port reset* - resets the controller's USB port.
+  - *Controller MCU reset* - resets the controller MCU after every wake-up.
+    Pick this level if only step 6 fixes rumble for you. The controller
+    reconnects for a few seconds after each wake.
+- **Fix rumble now** - one tap: MCU reset, settings put back, test pulse.
 - **Kernel reset-on-resume** (experimental toggle) - sets the
   `USB_QUIRK_RESET_RESUME` quirk for the controller at runtime, the same fix
   that was merged into the OpenGamingCollective kernel for Claw controllers
@@ -82,7 +88,16 @@ level already repairs.
 | 3. USB port reset | `USBDEVFS_RESET` on the controller | Short input hiccup |
 | 4. USB re-plug | Power-cycles the hub port (or rebinds the device) | Controller reconnects; reboot if it does not return |
 | 5. Restart InputPlumber | `systemctl restart inputplumber` | Virtual controller reconnects in Steam |
-| 6. Controller MCU reset | hid-msi `reset` attribute | Controller reboots; may restore MCU defaults |
+| 6. Controller MCU reset | hid-msi `reset` attribute | Controller reboots; gamepad mode, back-button mode and intensity are put back afterwards |
+
+## An extra "Xbox 360 Controller" appears in Steam
+
+That entry is the Claw's own physical pad (USB `0db0:1901`, XInput mode).
+InputPlumber normally hides it and shows Steam a virtual controller instead.
+A controller reset makes the pad re-enumerate on USB, and it can come back
+without being hidden again. The plugin detects this after an MCU reset and
+restarts InputPlumber when needed; the panel also shows a warning while the
+pad is visible. Manual way out: *Restart InputPlumber* (step 5) or reboot.
 
 ## Requirements and limits
 

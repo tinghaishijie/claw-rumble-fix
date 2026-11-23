@@ -39,6 +39,7 @@ interface Status {
   inputplumber: string;
   kernel: string;
   root: boolean;
+  pad_exposed: boolean;
   settings: { auto_level: string; reset_resume_quirk: boolean };
   targets: [number, number];
   resume_count: number;
@@ -68,6 +69,7 @@ const AUTO_OPTIONS = [
   { data: "intensity", label: "Check & restore intensity" },
   { data: "mode", label: "Re-send gamepad mode" },
   { data: "usb", label: "USB port reset" },
+  { data: "mcu", label: "Controller MCU reset" },
 ];
 
 // Ordered from the lightest to the heaviest intervention.
@@ -155,6 +157,15 @@ function Content() {
             />
           </PanelSectionRow>
         )}
+        {status?.pad_exposed && status.inputplumber === "active" && (
+          <PanelSectionRow>
+            <Field
+              label="Built-in pad is visible to Steam"
+              description="It shows up as an extra Xbox 360 controller. Use 'Restart InputPlumber' below, or reboot."
+              focusable
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Field label="Controller" focusable>
             {ctrl
@@ -173,6 +184,16 @@ function Content() {
           <Field label="Wake-ups seen" description={status?.last_result ?? undefined} focusable>
             {status?.resume_count ?? 0}
           </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={disabled || !ctrl?.has_reset}
+            description="Resets the controller MCU, keeps your settings, then pulses the motors. The controller reconnects for a few seconds."
+            onClick={() => run("fix_now", () => runAction("fix_now"))}
+          >
+            {busy === "fix_now" ? "Working..." : "Fix rumble now"}
+          </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
           <ButtonItem

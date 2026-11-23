@@ -37,6 +37,7 @@ RUN = "/run"
 VENDOR = "0db0"
 PID_MODES = {"1901": "xinput", "1902": "dinput", "1903": "desktop", "1904": "bios"}
 SWITCHABLE_MODES = ("xinput", "dinput")
+MKEY_MODES = ("macro", "disabled", "combination")
 
 USB_QUIRK_RESET_RESUME = 0x2
 USBDEVFS_RESET = 0x5514   # _IO('U', 20)
@@ -45,13 +46,15 @@ EVIOCRMFF = 0x40044581    # _IOW('E', 0x81, int)
 EV_FF = 0x15
 FF_RUMBLE = 0x50
 
-AUTO_LEVELS = ("off", "intensity", "mode", "usb")
+AUTO_LEVELS = ("off", "intensity", "mode", "usb", "mcu")
 DEFAULT_SETTINGS = {
     # What to do after every wake-up:
     #   off       - nothing
     #   intensity - read rumble intensity back, rewrite it only if it changed
     #   mode      - re-send the gamepad mode (USB re-enumeration), then intensity
     #   usb       - USB port reset, then intensity
+    #   mcu       - controller MCU reset (the only step confirmed to bring
+    #               rumble back on real hardware), then intensity
     "auto_level": "intensity",
     # Seconds to wait after wake before touching the MCU.
     "resume_delay": 3.0,
@@ -161,6 +164,56 @@ def has_rumble_attrs(cfg):
 def read_intensity(cfg):
     return (int(_read(os.path.join(cfg, "rumble_intensity_left"))),
             int(_read(os.path.join(cfg, "rumble_intensity_right"))))
+
+
+def event_nodes(ctrl):
+    """sysfs paths of every evdev node that belongs to the controller."""
+    base = os.path.join(ctrl["path"], ctrl["busid"] + ":*")
+    return sorted(glob.glob(os.path.join(base, "input/input*/event*")) +
+                  glob.glob(os.path.join(base, "0003:*/input/input*/event*")))
+
+
+def pad_exposed(ctrl):
+    """True when the physical gamepad node is usable by regular users.
+
+    InputPlumber hides the built-in pad (permissions 000, or the node moved
+    away) and shows Steam a virtual controller instead. If the pad stays
+    visible, Steam lists it as an extra "Xbox 360 Controller".
+    """
+    for event in event_nodes(ctrl):
+        try:
+            abs_caps = int(_read(os.path.join(event, "device/capabilities/abs")).split()[-1], 16)
+            if abs_caps & 0x3 != 0x3:  # needs ABS_X and ABS_Y: a stick, not a keyboard
+                continue
+            st = os.stat(os.path.join(DEV, "input", os.path.basename(event)))
+        except (OSError, ValueError, IndexError):
+            continue
+        if stat.S_IMODE(st.st_mode) != 0:
+            return True
+    return False
+
+
+def inputplumber_state():
+    _, out = _run_cmd(["systemctl", "is-active", "inputplumber.service"], 5)
+    return out.splitlines()[0] if out else "unknown"
+
+
+def read_mcu_state(cfg):
+    """Snapshot of the settings the MCU keeps (None where unreadable)."""
+    state = {}
+    for name in ("gamepad_mode", "mkeys_function",
+                 "rumble_intensity_left", "rumble_intensity_right"):
+        try:
+            state[name] = _read(os.path.join(cfg, name))
+        except OSError:
+            state[name] = None
+    return state
+
+
+def describe_state(state):
+    return "mode=%s mkeys=%s intensity=L%s/R%s" % (
+        state["gamepad_mode"], state["mkeys_function"],
+        state["rumble_intensity_left"], state["rumble_intensity_right"])
 
 
 def effective_targets(settings):
@@ -344,22 +397,76 @@ def act_usb_replug():
 
 
 def act_mcu_reset():
-    """Ask the controller MCU to reset itself (hid-msi 'reset' attribute)."""
+    """Reset the controller MCU (hid-msi 'reset' attribute).
+
+    The reset may bring the MCU back with different settings, so the gamepad
+    mode and the back-button mode are captured first and put back afterwards.
+    Rumble intensity is handled separately by act_intensity().
+    """
     ctrl = find_controller()
     if not ctrl:
         return _res(False, "controller not found on USB")
     path = os.path.join(ctrl["cfg"] or "", "reset")
     if not os.path.exists(path):
         return _res(False, "kernel driver exposes no reset attribute")
+    before = read_mcu_state(ctrl["cfg"])
+    hidden_before = not pad_exposed(ctrl)
     try:
         _write(path, 1)
     except OSError as exc:
         return _res(False, "MCU reset write failed: %s" % exc)
-    back = wait_reenumerated(ctrl["devnum"], 12.0)
-    if not back:
+    if not wait_reenumerated(ctrl["devnum"], 12.0):
         return _res(False, "MCU reset sent, no USB re-enumeration observed")
-    wait_cfg()
-    return _res(True, "MCU reset done, controller re-enumerated", changed=True)
+    back = wait_cfg()
+    if not back or not back["cfg"]:
+        return _res(True, "MCU reset done, config interface not back yet", changed=True)
+    time.sleep(1.0)
+    after = read_mcu_state(back["cfg"])
+    _log("MCU reset: before [%s] after [%s]" % (describe_state(before), describe_state(after)))
+    notes = []
+    for name, valid in (("gamepad_mode", SWITCHABLE_MODES), ("mkeys_function", MKEY_MODES)):
+        old, new = before[name], after[name]
+        if old not in valid or new is None or new == old:
+            continue
+        current = find_controller()
+        if not current or not current["cfg"]:
+            notes.append("%s not restored (controller missing)" % name)
+            continue
+        try:
+            # Both attributes send SWITCH_MODE, which re-enumerates the device.
+            _write(os.path.join(current["cfg"], name), old)
+        except OSError as exc:
+            notes.append("%s restore failed: %s" % (name, exc))
+            continue
+        wait_reenumerated(current["devnum"], 8.0)
+        wait_cfg()
+        time.sleep(0.5)
+        notes.append("%s restored %s -> %s" % (name, new, old))
+    # The re-enumerated pad must end up hidden behind InputPlumber again,
+    # otherwise Steam shows it as a second controller.
+    if hidden_before and inputplumber_state() == "active":
+        deadline = time.monotonic() + 6.0
+        exposed = True
+        while exposed and time.monotonic() < deadline:
+            current = find_controller()
+            exposed = bool(current) and pad_exposed(current)
+            if exposed:
+                time.sleep(0.5)
+        if exposed:
+            notes.append("built-in pad was left visible; " + act_restart_inputplumber()["msg"])
+    return _res(True, "MCU reset done" + ("; " + "; ".join(notes) if notes else ""),
+                changed=True)
+
+
+def act_mcu_fix(targets, pulse):
+    """The confirmed recovery: MCU reset, intensity check, optional test pulse."""
+    steps = [act_mcu_reset()]
+    if steps[0]["ok"]:
+        steps.append(act_intensity(targets, force=False))
+        if pulse:
+            steps.append(act_test_rumble())
+    return _res(all(s["ok"] for s in steps), "; ".join(s["msg"] for s in steps),
+                changed=True)
 
 
 def act_restart_inputplumber():
@@ -398,11 +505,8 @@ def act_test_rumble(seconds=0.6):
     ctrl = find_controller()
     if not ctrl:
         return _res(False, "controller not found on USB")
-    base = os.path.join(ctrl["path"], ctrl["busid"] + ":*")
-    events = glob.glob(os.path.join(base, "input/input*/event*")) + \
-        glob.glob(os.path.join(base, "0003:*/input/input*/event*"))
     try:
-        for event in sorted(events):
+        for event in event_nodes(ctrl):
             if not _has_ff_rumble(event):
                 continue
             fd = _open_chardev(event, os.O_RDWR)
@@ -435,7 +539,6 @@ ACTIONS = {
     "resend_mode": act_resend_mode,
     "usb_reset": act_usb_reset,
     "usb_replug": act_usb_replug,
-    "mcu_reset": act_mcu_reset,
     "restart_inputplumber": act_restart_inputplumber,
     "test_rumble": act_test_rumble,
 }
@@ -443,11 +546,18 @@ ACTIONS = {
 
 def auto_fix(level, targets):
     """Post-wake sequence for the configured automation level."""
+    ctrl = find_controller()
+    if ctrl and ctrl["cfg"]:
+        # Recorded on every wake so the history shows what the MCU state
+        # looked like before rumble was lost.
+        _log("state after wake: %s" % describe_state(read_mcu_state(ctrl["cfg"])))
     steps = []
     if level == "mode":
         steps.append(act_resend_mode())
     elif level == "usb":
         steps.append(act_usb_reset())
+    elif level == "mcu":
+        steps.append(act_mcu_reset())
     steps.append(act_intensity(targets, force=False))
     return _res(all(s["ok"] for s in steps), "; ".join(s["msg"] for s in steps),
                 changed=any(s["changed"] for s in steps))
@@ -540,10 +650,11 @@ def build_status():
             and (ctrl["left"], ctrl["right"]) != (0, 0)):
         settings["target_left"], settings["target_right"] = ctrl["left"], ctrl["right"]
         save_settings()
-    code, ip_state = _run_cmd(["systemctl", "is-active", "inputplumber.service"], 5)
+    raw = find_controller()
     return {
         "controller": ctrl,
-        "inputplumber": ip_state.splitlines()[0] if ip_state else "unknown",
+        "inputplumber": inputplumber_state(),
+        "pad_exposed": bool(raw) and pad_exposed(raw),
         "kernel": os.uname().release,
         "root": os.geteuid() == 0,
         "settings": dict(settings),
@@ -682,7 +793,9 @@ async def _handle_resume(source, slept):
     result = await _locked(auto_fix, level, effective_targets(STATE.settings))
     STATE.last_result = "wake #%d: %s" % (count, result["msg"])
     _log(STATE.last_result)
-    if result["changed"] or not result["ok"]:
+    # Toast on failures, and on repairs the user did not ask for explicitly;
+    # the routine reset of the heavier levels would otherwise toast every wake.
+    if not result["ok"] or (level == "intensity" and result["changed"]):
         await decky.emit("claw_rumble_fix_result", result["ok"], result["msg"])
 
 
@@ -727,8 +840,11 @@ class Plugin:
         asyncio.ensure_future(handle_resume("steam"))
 
     async def run_action(self, name):
+        targets = effective_targets(STATE.settings)
         if name == "intensity":
-            result = await _locked(act_intensity, effective_targets(STATE.settings), True)
+            result = await _locked(act_intensity, targets, True)
+        elif name in ("mcu_reset", "fix_now"):
+            result = await _locked(act_mcu_fix, targets, name == "fix_now")
         elif name in ACTIONS:
             result = await _locked(ACTIONS[name])
         else:
