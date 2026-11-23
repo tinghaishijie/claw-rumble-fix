@@ -1,0 +1,11 @@
+{
+  "name": "Claw Rumble Fix",
+  "author": "claw-rumble-fix contributors",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["msi", "claw", "rumble", "root"],
+    "description": "Restores rumble on the MSI Claw A8 built-in controller after suspend/resume, without an EC reset.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}
