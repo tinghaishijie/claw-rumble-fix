@@ -36,15 +36,15 @@ reset (holding the power button for ~25 s) brought it back.
 
 Install Decky Loader first. Then, in Desktop Mode, either:
 
-**Installer script** (recommended). Copy `claw-rumble-fix.zip` from the release
-assets and `install.sh` to the Claw, then run in Konsole:
+**Installer script** (recommended). Run in Konsole:
 
 ```bash
-bash install.sh ~/Downloads/claw-rumble-fix.zip
+curl -fsSL https://raw.githubusercontent.com/tinghaishijie/claw-rumble-fix/main/install.sh | bash
 ```
 
-Without an argument the script downloads the latest release itself; that only
-works while the repository is public.
+It downloads the newest release, verifies its checksum and restarts Decky. To
+install an archive you already have, pass its path:
+`bash install.sh ~/Downloads/claw-rumble-fix.zip`.
 
 **Decky's ZIP installer.** Decky settings -> General -> enable **Developer
 mode**; then Developer -> **Install plugin from ZIP file**, pick the zip and
@@ -56,8 +56,6 @@ The backend runs as root (required for sysfs writes and USB resets).
 
 - Use `claw-rumble-fix.zip` from the release **assets**. GitHub's "Source
   code (zip)" has no built frontend and will not load.
-- While the repository is private, "Install plugin from URL" and
-  unauthenticated downloads fail: the saved file is an error page, not a zip.
 - Check the loader log: `journalctl -u plugin_loader -b --no-pager | tail -n 80`
 
 ## Finding out what actually fixes your device

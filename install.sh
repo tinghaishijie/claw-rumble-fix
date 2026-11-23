@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install Claw Rumble Fix into Decky Loader, bypassing Decky's own ZIP installer.
 #
-#   ./install.sh                             download the latest release (public repo only)
+#   ./install.sh                             download the newest release (public repo only)
 #   ./install.sh /path/to/claw-rumble-fix.zip    install a local archive
 set -euo pipefail
 
@@ -24,13 +24,26 @@ trap 'rm -rf -- "$workdir"' EXIT
 
 if [ -z "$ARCHIVE" ]; then
   ARCHIVE="$workdir/$NAME.zip"
-  url="https://github.com/$REPO/releases/latest/download/$NAME.zip"
-  echo "Downloading $url"
-  if ! curl -fLsS "$url" -o "$ARCHIVE"; then
-    echo "Download failed. If the repository is private, copy $NAME.zip to this" >&2
-    echo "device and run: ./install.sh /path/to/$NAME.zip" >&2
+  # Newest release including pre-releases ("latest" skips those).
+  if ! curl -fLsS "https://api.github.com/repos/$REPO/releases?per_page=1" -o "$workdir/release.json"; then
+    echo "Could not query releases. If the repository is private, copy $NAME.zip" >&2
+    echo "to this device and run: ./install.sh /path/to/$NAME.zip" >&2
     exit 1
   fi
+  tag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["tag_name"])' "$workdir/release.json")
+  url="https://github.com/$REPO/releases/download/$tag/$NAME.zip"
+  echo "Downloading $url"
+  curl -fLsS "$url" -o "$ARCHIVE"
+  curl -fLsS "$url.sha256" -o "$ARCHIVE.sha256"
+  python3 - "$ARCHIVE" <<'PY'
+import hashlib
+import sys
+
+archive = sys.argv[1]
+expected = open(archive + ".sha256").read().split()[0]
+if hashlib.sha256(open(archive, "rb").read()).hexdigest() != expected:
+    raise SystemExit("Archive checksum mismatch")
+PY
 fi
 
 # Validate and unpack with Python: SteamOS always has it, unzip may be missing.
