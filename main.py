@@ -545,6 +545,7 @@ def build_status():
         "controller": ctrl,
         "inputplumber": ip_state.splitlines()[0] if ip_state else "unknown",
         "kernel": os.uname().release,
+        "root": os.geteuid() == 0,
         "settings": dict(settings),
         "targets": list(effective_targets(settings)),
         "resume_count": STATE.resume_count,

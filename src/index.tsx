@@ -38,6 +38,7 @@ interface Status {
   controller: ControllerStatus | null;
   inputplumber: string;
   kernel: string;
+  root: boolean;
   settings: { auto_level: string; reset_resume_quirk: boolean };
   targets: [number, number];
   resume_count: number;
@@ -145,6 +146,15 @@ function Content() {
   return (
     <>
       <PanelSection title="Status">
+        {status && !status.root && (
+          <PanelSectionRow>
+            <Field
+              label="Backend is not running as root"
+              description="Recovery actions will fail. Reinstall the plugin and restart Decky."
+              focusable
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Field label="Controller" focusable>
             {ctrl
