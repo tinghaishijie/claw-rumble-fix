@@ -5,14 +5,41 @@ Extreme, board `MS-1T8K`) running SteamOS. It targets one problem: rumble
 disappears after a number of suspend/resume cycles and, until now, only an EC
 reset (holding the power button for ~25 s) brought it back.
 
-> Status: on one MSI Claw A8 the rumble loss was reproduced and **only the
-> controller MCU reset (step 6) brought rumble back**; rewriting the intensity,
-> re-sending the gamepad mode, USB resets and restarting InputPlumber did not.
-> That reset is what the plugin now automates. The automatic after-wake path
-> is unit-tested against a simulated sysfs tree but has not been confirmed on
-> hardware yet, and the underlying MCU bug is still unexplained.
+> Status: on one MSI Claw A8 (SteamOS 3.9.5, kernel 7.2.7-valve2, InputPlumber
+> 0.78.0) the rumble loss was reproduced. **Only the controller MCU reset
+> brought rumble back**; rewriting the intensity, re-sending the gamepad mode,
+> USB resets and restarting InputPlumber did not. The leading suspect is
+> described under [Suspected cause](#suspected-cause); the plugin can switch
+> it off, but whether that prevents the loss is **not confirmed yet**.
+
+## Suspected cause
+
+In the broken state the USB link is healthy, the stored rumble intensity is
+intact and the kernel accepts rumble commands, but the motors stay silent
+until the MCU is reset. So the controller MCU itself is in a bad state.
+
+The kernel log of the affected device shows a burst of
+`hid-msi: Got unexpected ACK from MCU` after every wake-up, roughly 170 in two
+days. Each one is the MCU acknowledging a **flash commit**. They come from
+InputPlumber's udev rule (`99-inputplumber-device-setup.rules`), which assigns
+`button_m1` and `button_m2` on every add/change/bind event of the `hid-msi`
+device, whether or not the value changed; the kernel driver commits the
+controller flash on each assignment. Upstream fixed a related hazard in the
+kernel ([OpenGamingCollective/linux#133](https://github.com/OpenGamingCollective/linux/pull/133)),
+which is not in the SteamOS kernel tested here.
+
+This is a correlation, not a proven cause. **Stop redundant flash writes**
+removes those commits so the theory can be tested: with it on, the *Flash
+commits since boot* counter should stop growing after wake-ups, and if the
+theory holds, rumble should stop disappearing.
 
 ## What it does
+
+- **Stop redundant flash writes** - installs a runtime copy of InputPlumber's
+  udev rule in `/run/udev/rules.d` in which every setting is only written when
+  it differs from the wanted value. Nothing persistent is changed; the copy is
+  regenerated from the installed rule at every start and is gone after a
+  reboot once the option is off.
 
 - **Detects every wake-up** on its own (it compares `CLOCK_BOOTTIME` with
   `CLOCK_MONOTONIC`) and also listens to Steam's resume notification.
@@ -94,16 +121,12 @@ level already repairs.
 
 That entry is the Claw's own physical pad (USB `0db0:1901`, XInput mode).
 InputPlumber normally hides it and shows Steam a virtual controller instead.
-A controller reset makes the pad re-enumerate on USB, and it can come back
-without being hidden again. The plugin detects this after an MCU reset and
-restarts InputPlumber when needed; the panel also shows a warning while the
-pad is visible. Manual way out: *Restart InputPlumber* (step 5) or reboot.
-
-If the entry stays after restarting InputPlumber, check the **Gamepad mode**
-selector in the panel: the MCU reset can bring the controller back in a
-different mode (XInput/DInput) than the one your setup was using. Switch it
-and see whether the extra entry disappears. The diagnostics report lists the
-controller's evdev nodes and whether InputPlumber is hiding them.
+It showed up after an MCU reset, which makes the pad re-enumerate on USB, and
+restarting InputPlumber did not remove it. The likely explanation (not
+verified) is that Steam opens the pad in the short window before InputPlumber
+hides it again and then keeps it open. A reboot or a Steam restart should
+clear the entry. Because of this, resetting the MCU after every wake-up is
+not recommended as a permanent solution.
 
 ## Requirements and limits
 

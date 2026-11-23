@@ -17,6 +17,7 @@ class FakeDecky(types.ModuleType):
         self.logger = types.SimpleNamespace(info=lambda *a: None, error=lambda *a: None)
         self.DECKY_USER = "nobody"
         self.DECKY_USER_HOME = tempfile.mkdtemp()
+        self.DECKY_HOME = tempfile.mkdtemp()
         self.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
 
     async def emit(self, *args):
@@ -219,6 +220,78 @@ class Diagnostics(Base):
         self.assertIn("controller evdev nodes (pad_exposed=", report)
         self.assertIn("name=Fake Pad", report)
         self.assertIn("gamepad_mode = dinput", report)
+
+
+class UdevOverride(Base):
+    V078 = ('ACTION=="add|change|bind", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="190[1-3]", '
+            'SUBSYSTEM=="hid", DRIVER=="hid-msi", ATTR{button_m1}="KEY_RIGHTBRACE", '
+            'ATTR{button_m2}="KEY_LEFTBRACE", GOTO="claw_desktop"')
+    MATCH = ('ACTION=="add|change|bind", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="190[1-3]", '
+             'SUBSYSTEM=="hid", DRIVER=="hid-msi"')
+
+    def setUp(self):
+        super().setUp()
+        self.saved = (main.RULES_SOURCE_DIR, main.RULES_ETC_DIR, main.RULES_OVERRIDE_DIR,
+                      main._run_cmd)
+        main.RULES_SOURCE_DIR = tempfile.mkdtemp()
+        main.RULES_ETC_DIR = tempfile.mkdtemp()
+        main.RULES_OVERRIDE_DIR = os.path.join(tempfile.mkdtemp(), "rules.d")
+        self.commands = []
+        main._run_cmd = lambda args, timeout=0: (self.commands.append(args), (0, ""))[1]
+        self.source = os.path.join(main.RULES_SOURCE_DIR, main.RULES_NAME)
+        self.override = os.path.join(main.RULES_OVERRIDE_DIR, main.RULES_NAME)
+
+    def tearDown(self):
+        (main.RULES_SOURCE_DIR, main.RULES_ETC_DIR, main.RULES_OVERRIDE_DIR,
+         main._run_cmd) = self.saved
+        super().tearDown()
+
+    def test_unconditional_writes_become_conditional(self):
+        self.assertEqual(main.soften_rule(self.V078), [
+            self.MATCH + ', ATTR{button_m1}!="KEY_RIGHTBRACE", ATTR{button_m1}="KEY_RIGHTBRACE"',
+            self.MATCH + ', ATTR{button_m2}!="KEY_LEFTBRACE", ATTR{button_m2}="KEY_LEFTBRACE"',
+            self.MATCH + ', GOTO="claw_desktop"',
+        ])
+
+    def test_existing_conditions_are_kept(self):
+        line = ('ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", '
+                'ATTR{gamepad_mode}="xinput", GOTO="end"')
+        self.assertEqual(main.soften_rule(line), [
+            'ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", '
+            'ATTR{gamepad_mode}!="xinput", ATTR{gamepad_mode}="xinput"',
+            'ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", GOTO="end"',
+        ])
+
+    def test_unrelated_lines_are_untouched(self):
+        for line in ("# MSI Claw Settings", "", 'LABEL="claw_desktop"',
+                     'ACTION=="add", DRIVER=="asus_rog_ally", ATTR{gamepad_mode}="1"',
+                     'ACTION=="add", DRIVER=="hid-msi", GOTO="end"'):
+            self.assertEqual(main.soften_rule(line), [line])
+
+    def test_enable_writes_runtime_override_and_reloads(self):
+        put(self.source, "# header\n" + self.V078 + '\nLABEL="claw_desktop"')
+        result = main.act_quiet_udev(True)
+        self.assertTrue(result["ok"], result["msg"])
+        with open(self.override) as f:
+            text = f.read()
+        self.assertIn('ATTR{button_m1}!="KEY_RIGHTBRACE", ATTR{button_m1}="KEY_RIGHTBRACE"', text)
+        self.assertIn('LABEL="claw_desktop"', text)
+        self.assertNotIn(self.V078, text)
+        self.assertEqual(self.commands, [["udevadm", "control", "--reload"]])
+        self.assertTrue(main.act_quiet_udev(False)["ok"])
+        self.assertFalse(os.path.exists(self.override))
+
+    def test_user_override_in_etc_is_respected(self):
+        put(self.source, self.V078)
+        put(os.path.join(main.RULES_ETC_DIR, main.RULES_NAME), "# mine")
+        self.assertFalse(main.act_quiet_udev(True)["ok"])
+        self.assertFalse(os.path.exists(self.override))
+
+    def test_missing_or_irrelevant_rule_file_fails_cleanly(self):
+        self.assertFalse(main.act_quiet_udev(True)["ok"])
+        put(self.source, "# nothing for the claw here")
+        self.assertFalse(main.act_quiet_udev(True)["ok"])
+        self.assertFalse(os.path.exists(self.override))
 
 
 class Quirk(Base):

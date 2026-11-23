@@ -40,7 +40,9 @@ interface Status {
   kernel: string;
   root: boolean;
   pad_exposed: boolean;
-  settings: { auto_level: string; reset_resume_quirk: boolean };
+  flash_acks: number | null;
+  quiet_udev_active: boolean;
+  settings: { auto_level: string; reset_resume_quirk: boolean; quiet_udev: boolean };
   targets: [number, number];
   resume_count: number;
   last_result: string | null;
@@ -59,6 +61,7 @@ const setTargets = callable<[left: number, right: number], Result>("set_targets"
 const setAutoLevel = callable<[level: string], Result>("set_auto_level");
 const setGamepadMode = callable<[mode: string], Result>("set_gamepad_mode");
 const setQuirk = callable<[enable: boolean], Result>("set_quirk");
+const setQuietUdev = callable<[enable: boolean], Result>("set_quiet_udev");
 const saveDiagnostics = callable<[], Result>("save_diagnostics");
 const notifyResume = callable<[], void>("notify_resume");
 
@@ -228,6 +231,31 @@ function Content() {
             <Field label={message} focusable />
           </PanelSectionRow>
         )}
+      </PanelSection>
+
+      <PanelSection title="Prevention">
+        <PanelSectionRow>
+          <ToggleField
+            label="Stop redundant flash writes"
+            description={
+              status?.quiet_udev_active
+                ? "Active: InputPlumber's udev rule only writes controller settings that actually changed."
+                : "InputPlumber rewrites unchanged settings into the controller flash on every device event. Suspected cause of the rumble loss."
+            }
+            checked={status?.settings.quiet_udev ?? false}
+            disabled={disabled}
+            onChange={(value) => run("quiet", () => setQuietUdev(value))}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Field
+            label="Flash commits since boot"
+            description="Counted from the kernel log. Should stop growing after wake-ups once the option above is on."
+            focusable
+          >
+            {status?.flash_acks ?? "?"}
+          </Field>
+        </PanelSectionRow>
       </PanelSection>
 
       <PanelSection title="After wake-up">
