@@ -344,6 +344,32 @@ def act_resend_mode():
     return _res(True, "mode '%s' re-sent, controller re-enumerated" % mode, changed=True)
 
 
+def act_set_mode(mode):
+    """Switch the controller between XInput and DInput (stored in the MCU)."""
+    if mode not in SWITCHABLE_MODES:
+        return _res(False, "unknown gamepad mode '%s'" % mode)
+    ctrl = find_controller()
+    if not ctrl:
+        return _res(False, "controller not found on USB")
+    if not ctrl["cfg"]:
+        return _res(False, "kernel driver exposes no gamepad_mode attribute")
+    try:
+        _write(os.path.join(ctrl["cfg"], "gamepad_mode"), mode)
+    except OSError as exc:
+        return _res(False, "gamepad_mode write failed: %s" % exc)
+    wait_reenumerated(ctrl["devnum"], 8.0)
+    back = wait_cfg()
+    time.sleep(0.5)
+    try:
+        now = _read(os.path.join(back["cfg"], "gamepad_mode"))
+    except (OSError, TypeError):
+        now = None
+    if now != mode:
+        return _res(False, "controller reports mode '%s' after switching to '%s'"
+                    % (now, mode), changed=True)
+    return _res(True, "gamepad mode is now '%s'" % mode, changed=True)
+
+
 def act_usb_reset():
     """USB port reset (same thing the kernel reset-resume quirk does)."""
     ctrl = find_controller()
@@ -691,6 +717,40 @@ def write_diagnostics():
                 except OSError as exc:
                     dump.append("%s/%s ! %s" % (os.path.basename(root), name, exc))
         section("controller sysfs", "\n".join(dump))
+        nodes = []
+        for event in event_nodes(ctrl):
+            entry = [os.path.basename(event)]
+            for attr in ("device/name", "device/capabilities/abs", "device/capabilities/ff"):
+                try:
+                    entry.append("%s=%s" % (attr.rsplit("/", 1)[-1], _read(os.path.join(event, attr))))
+                except OSError:
+                    pass
+            try:
+                st = os.stat(os.path.join(DEV, "input", os.path.basename(event)))
+                entry.append("node mode=%o uid=%d gid=%d" % (stat.S_IMODE(st.st_mode),
+                                                              st.st_uid, st.st_gid))
+            except OSError as exc:
+                entry.append("node: %s" % exc)
+            nodes.append("  ".join(entry))
+        section("controller evdev nodes (pad_exposed=%s)" % pad_exposed(ctrl), "\n".join(nodes))
+    # What the rest of the system sees: needed to tell whether the physical
+    # pad is hidden behind InputPlumber's virtual controller.
+    try:
+        section("/proc/bus/input/devices", _read("/proc/bus/input/devices"))
+    except OSError as exc:
+        section("/proc/bus/input/devices", str(exc))
+    for title, args in (
+            ("ls -l /dev/input", ["ls", "-l", "/dev/input"]),
+            ("ls -l /dev/inputplumber/sources", ["ls", "-l", "/dev/inputplumber/sources"]),
+            ("ls -l /dev/hidraw*", ["sh", "-c", "ls -l /dev/hidraw*"]),
+            ("inputplumber version", ["sh", "-c", "inputplumber --version; pacman -Q inputplumber"]),
+            ("inputplumber dbus tree", ["busctl", "tree", "org.shadowblip.InputPlumber"]),
+            ("inputplumber hide rules", ["sh", "-c", "ls -l /run/udev/rules.d; "
+                                         "cat /run/udev/rules.d/*inputplumber* 2>/dev/null | head -n 80"]),
+            ("inputplumber Claw configs", ["sh", "-c", "for f in /usr/share/inputplumber/devices/*claw* "
+                                           "/etc/inputplumber/devices.d/*; do echo \"## $f\"; "
+                                           "cat \"$f\"; done 2>&1 | head -n 400"])):
+        section(title, _run_cmd(args, 15)[1])
     try:
         section("usbcore quirks", _read(quirk_param_path()))
     except OSError as exc:
@@ -858,6 +918,11 @@ class Plugin:
         save_settings()
         result = await _locked(act_intensity, (left, right), True)
         _log("set intensity: %s" % result["msg"])
+        return result
+
+    async def set_gamepad_mode(self, mode):
+        result = await _locked(act_set_mode, mode)
+        _log("set gamepad mode: %s" % result["msg"])
         return result
 
     async def set_auto_level(self, level):

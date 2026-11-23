@@ -99,6 +99,12 @@ without being hidden again. The plugin detects this after an MCU reset and
 restarts InputPlumber when needed; the panel also shows a warning while the
 pad is visible. Manual way out: *Restart InputPlumber* (step 5) or reboot.
 
+If the entry stays after restarting InputPlumber, check the **Gamepad mode**
+selector in the panel: the MCU reset can bring the controller back in a
+different mode (XInput/DInput) than the one your setup was using. Switch it
+and see whether the extra entry disappears. The diagnostics report lists the
+controller's evdev nodes and whether InputPlumber is hiding them.
+
 ## Requirements and limits
 
 - Steps 1, 2, 6 and the intensity check need the in-kernel `hid-msi` driver

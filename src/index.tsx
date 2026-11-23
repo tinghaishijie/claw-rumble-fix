@@ -57,12 +57,18 @@ const getStatus = callable<[], Status>("get_status");
 const runAction = callable<[name: string], Result>("run_action");
 const setTargets = callable<[left: number, right: number], Result>("set_targets");
 const setAutoLevel = callable<[level: string], Result>("set_auto_level");
+const setGamepadMode = callable<[mode: string], Result>("set_gamepad_mode");
 const setQuirk = callable<[enable: boolean], Result>("set_quirk");
 const saveDiagnostics = callable<[], Result>("save_diagnostics");
 const notifyResume = callable<[], void>("notify_resume");
 
 const TITLE = "Claw Rumble Fix";
 const RESULT_EVENT = "claw_rumble_fix_result";
+
+const MODE_OPTIONS = [
+  { data: "xinput", label: "XInput" },
+  { data: "dinput", label: "DInput" },
+];
 
 const AUTO_OPTIONS = [
   { data: "off", label: "Do nothing" },
@@ -175,6 +181,18 @@ function Content() {
                 : "..."}
           </Field>
         </PanelSectionRow>
+        {ctrl?.has_cfg && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="Gamepad mode"
+              description="Stored in the controller. It reconnects after a change; if the controls stop responding, switch back using the touchscreen."
+              rgOptions={MODE_OPTIONS}
+              selectedOption={ctrl.gamepad_mode ?? ctrl.pid_mode}
+              disabled={disabled}
+              onChange={(option) => run("mode", () => setGamepadMode(option.data))}
+            />
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Field label="Rumble intensity" focusable>
             {intensity}

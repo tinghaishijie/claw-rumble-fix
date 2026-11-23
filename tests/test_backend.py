@@ -158,6 +158,12 @@ class McuReset(Base):
         self.assertEqual(main.read_intensity(self.cfg), (100, 100))
         self.assertIn("mkeys_function restored macro -> combination", result["msg"])
 
+    def test_mode_switch_is_verified(self):
+        result = main.act_set_mode("xinput")
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(main._read(os.path.join(self.cfg, "gamepad_mode")), "xinput")
+        self.assertFalse(main.act_set_mode("desktop")["ok"])
+
     def test_auto_level_mcu_resets_on_wake(self):
         main.STATE.settings["auto_level"] = "mcu"
         asyncio.run(main.handle_resume("clock", 30.0))
@@ -200,6 +206,19 @@ class Exposure(Base):
         put(os.path.join(event, "device/capabilities/abs"), "100000000")
         put(os.path.join(main.DEV, "input/event8"), "")
         self.assertFalse(main.pad_exposed(main.find_controller()))
+
+
+class Diagnostics(Base):
+    def test_report_is_written_without_system_tools(self):
+        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
+        put(os.path.join(event, "device/capabilities/abs"), "3003f")
+        put(os.path.join(event, "device/name"), "Fake Pad")
+        path = main.write_diagnostics()
+        with open(path) as f:
+            report = f.read()
+        self.assertIn("controller evdev nodes (pad_exposed=", report)
+        self.assertIn("name=Fake Pad", report)
+        self.assertIn("gamepad_mode = dinput", report)
 
 
 class Quirk(Base):
