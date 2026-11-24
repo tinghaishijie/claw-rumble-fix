@@ -1,16 +1,17 @@
 """Claw Rumble Fix - Decky Loader backend.
 
 The MSI Claw A8 built-in controller (USB 0db0:190x) can lose rumble after a
-number of suspend/resume cycles on SteamOS; so far only an EC reset was known
-to bring it back. This backend:
+number of suspend/resume cycles on SteamOS. Findings on real hardware:
 
-  * detects every wake-up (CLOCK_BOOTTIME vs CLOCK_MONOTONIC drift, plus a
-    notification from the Steam frontend),
-  * verifies the controller MCU state after wake and repairs it,
-  * exposes a ladder of manual recovery actions, from light to heavy,
-  * offers a rumble test that talks to the hardware directly, bypassing
-    InputPlumber and Steam Input, and
-  * writes a diagnostics report so the failing layer can be identified.
+  * the USB link, the gamepad mode and the stored rumble intensity are all
+    intact while rumble is dead; only a controller MCU reset revives it
+    (re-sending settings, USB resets and restarting InputPlumber do not);
+  * InputPlumber's udev rule recommits the controller flash several times
+    after every wake-up, which is the suspected trigger.
+
+So this backend does three things: it can stop those redundant flash writes,
+it can reset the MCU when rumble is gone, and it records what happens around
+each wake-up so the theory can be checked.
 
 Everything here is Python 3.9 compatible and uses the standard library only.
 """
@@ -39,34 +40,20 @@ PID_MODES = {"1901": "xinput", "1902": "dinput", "1903": "desktop", "1904": "bio
 SWITCHABLE_MODES = ("xinput", "dinput")
 MKEY_MODES = ("macro", "disabled", "combination")
 
-USB_QUIRK_RESET_RESUME = 0x2
-USBDEVFS_RESET = 0x5514   # _IO('U', 20)
 EVIOCSFF = 0x40304580     # _IOW('E', 0x80, struct ff_effect), 48 bytes on x86-64
 EVIOCRMFF = 0x40044581    # _IOW('E', 0x81, int)
 EV_FF = 0x15
 FF_RUMBLE = 0x50
 
-AUTO_LEVELS = ("off", "intensity", "mode", "usb", "mcu")
 DEFAULT_SETTINGS = {
-    # What to do after every wake-up:
-    #   off       - nothing
-    #   intensity - read rumble intensity back, rewrite it only if it changed
-    #   mode      - re-send the gamepad mode (USB re-enumeration), then intensity
-    #   usb       - USB port reset, then intensity
-    #   mcu       - controller MCU reset (the only step confirmed to bring
-    #               rumble back on real hardware), then intensity
-    "auto_level": "intensity",
-    # Seconds to wait after wake before touching the MCU.
-    "resume_delay": 3.0,
-    # Desired rumble intensity (0-100). None = adopt the hardware values.
-    "target_left": None,
-    "target_right": None,
-    # Ask the kernel to reset the controller's USB port on every resume.
-    "reset_resume_quirk": False,
     # Stop InputPlumber's udev rule from rewriting unchanged settings into the
     # controller flash on every device event.
     "quiet_udev": False,
 }
+# Seconds to let the controller settle after a wake-up before reading it.
+WAKE_SETTLE = 3.0
+# Window after a wake-up in which flash commits are counted.
+WAKE_WINDOW = 45.0
 
 
 class State:
@@ -75,7 +62,7 @@ class State:
         self.history = collections.deque(maxlen=300)
         self.resume_count = 0
         self.last_handled = -1e9
-        self.last_result = None
+        self.last_wake = None
         self.lock = None
         self.watch_task = None
 
@@ -151,24 +138,6 @@ def find_controller():
     return None
 
 
-def quirk_active(ctrl):
-    try:
-        return bool(int(ctrl["quirks"], 16) & USB_QUIRK_RESET_RESUME)
-    except (TypeError, ValueError):
-        return False
-
-
-def has_rumble_attrs(cfg):
-    return bool(cfg) and all(
-        os.path.exists(os.path.join(cfg, "rumble_intensity_" + side))
-        for side in ("left", "right"))
-
-
-def read_intensity(cfg):
-    return (int(_read(os.path.join(cfg, "rumble_intensity_left"))),
-            int(_read(os.path.join(cfg, "rumble_intensity_right"))))
-
-
 def event_nodes(ctrl):
     """sysfs paths of every evdev node that belongs to the controller."""
     base = os.path.join(ctrl["path"], ctrl["busid"] + ":*")
@@ -217,11 +186,6 @@ def describe_state(state):
     return "mode=%s mkeys=%s intensity=L%s/R%s" % (
         state["gamepad_mode"], state["mkeys_function"],
         state["rumble_intensity_left"], state["rumble_intensity_right"])
-
-
-def effective_targets(settings):
-    left, right = settings.get("target_left"), settings.get("target_right")
-    return (100 if left is None else int(left), 100 if right is None else int(right))
 
 
 def wait_reenumerated(old_devnum, timeout=10.0):
@@ -281,156 +245,15 @@ def _open_chardev(sys_node, flags):
 
 
 # --------------------------------------------------------------------------
-# Recovery actions (blocking; run in a worker thread)
+# Controller actions (blocking; run in a worker thread)
 # --------------------------------------------------------------------------
-
-def act_intensity(targets, force):
-    """Verify the MCU rumble intensity and rewrite it when lost (or forced)."""
-    ctrl = find_controller()
-    if not ctrl:
-        return _res(False, "controller not found on USB")
-    cfg = ctrl["cfg"]
-    if not has_rumble_attrs(cfg):
-        msg = "kernel driver exposes no rumble_intensity_* attributes"
-        return _res(not force, "skipped: " + msg, skipped=True)
-    try:
-        before = read_intensity(cfg)
-    except (OSError, ValueError) as exc:
-        before = None
-        _log("intensity read failed: %s" % exc)
-    if before == tuple(targets) and not force:
-        return _res(True, "intensity intact (L%d/R%d)" % before)
-    shown = "unreadable" if before is None else "L%d/R%d" % before
-    last_error = None
-    for _ in range(3):
-        try:
-            # Each store ends with a fire-and-forget flash commit; give the MCU
-            # time to retire it before the next command.
-            _write(os.path.join(cfg, "rumble_intensity_left"), targets[0])
-            time.sleep(0.5)
-            _write(os.path.join(cfg, "rumble_intensity_right"), targets[1])
-            time.sleep(0.5)
-            after = read_intensity(cfg)
-            if after == tuple(targets):
-                return _res(True, "intensity rewritten: %s -> L%d/R%d" % ((shown,) + after),
-                            changed=True)
-            last_error = "read back L%d/R%d" % after
-        except (OSError, ValueError) as exc:
-            last_error = str(exc)
-        time.sleep(1.0)
-    return _res(False, "intensity rewrite failed (was %s): %s" % (shown, last_error))
-
-
-def act_resend_mode():
-    """Re-send the current gamepad mode; the MCU re-enumerates on USB."""
-    ctrl = find_controller()
-    if not ctrl:
-        return _res(False, "controller not found on USB")
-    if not ctrl["cfg"]:
-        return _res(False, "kernel driver exposes no gamepad_mode attribute")
-    path = os.path.join(ctrl["cfg"], "gamepad_mode")
-    try:
-        mode = _read(path)
-    except OSError:
-        mode = ctrl["pid_mode"]
-    if mode not in SWITCHABLE_MODES:
-        mode = ctrl["pid_mode"] if ctrl["pid_mode"] in SWITCHABLE_MODES else "xinput"
-    try:
-        _write(path, mode)
-    except OSError as exc:
-        return _res(False, "gamepad_mode write failed: %s" % exc)
-    back = wait_reenumerated(ctrl["devnum"], 8.0)
-    if not back:
-        return _res(True, "mode '%s' re-sent (no USB re-enumeration observed)" % mode,
-                    changed=True)
-    wait_cfg()
-    return _res(True, "mode '%s' re-sent, controller re-enumerated" % mode, changed=True)
-
-
-def act_set_mode(mode):
-    """Switch the controller between XInput and DInput (stored in the MCU)."""
-    if mode not in SWITCHABLE_MODES:
-        return _res(False, "unknown gamepad mode '%s'" % mode)
-    ctrl = find_controller()
-    if not ctrl:
-        return _res(False, "controller not found on USB")
-    if not ctrl["cfg"]:
-        return _res(False, "kernel driver exposes no gamepad_mode attribute")
-    try:
-        _write(os.path.join(ctrl["cfg"], "gamepad_mode"), mode)
-    except OSError as exc:
-        return _res(False, "gamepad_mode write failed: %s" % exc)
-    wait_reenumerated(ctrl["devnum"], 8.0)
-    back = wait_cfg()
-    time.sleep(0.5)
-    try:
-        now = _read(os.path.join(back["cfg"], "gamepad_mode"))
-    except (OSError, TypeError):
-        now = None
-    if now != mode:
-        return _res(False, "controller reports mode '%s' after switching to '%s'"
-                    % (now, mode), changed=True)
-    return _res(True, "gamepad mode is now '%s'" % mode, changed=True)
-
-
-def act_usb_reset():
-    """USB port reset (same thing the kernel reset-resume quirk does)."""
-    ctrl = find_controller()
-    if not ctrl:
-        return _res(False, "controller not found on USB")
-    try:
-        node = os.path.join(DEV, "bus/usb", "%03d" % int(ctrl["busnum"]),
-                            "%03d" % int(ctrl["devnum"]))
-        fd = os.open(node, os.O_WRONLY)
-        try:
-            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
-        finally:
-            os.close(fd)
-    except (OSError, TypeError, ValueError) as exc:
-        return _res(False, "USB port reset failed: %s" % exc)
-    time.sleep(1.5)
-    back = wait_cfg()
-    if not back:
-        return _res(False, "USB port reset sent, controller did not come back")
-    return _res(True, "USB port reset done", changed=True)
-
-
-def act_usb_replug():
-    """Simulated unplug/replug: power-cycle the hub port, or rebind the device."""
-    ctrl = find_controller()
-    if not ctrl:
-        return _res(False, "controller not found on USB")
-    port_disable = os.path.join(os.path.realpath(os.path.join(ctrl["path"], "port")),
-                                "disable")
-    how = "hub port power cycle"
-    try:
-        if os.path.exists(port_disable):
-            try:
-                _write(port_disable, 1)
-                time.sleep(1.5)
-            finally:
-                _write(port_disable, 0)
-        else:
-            how = "USB driver rebind"
-            drv = os.path.join(SYS, "bus/usb/drivers/usb")
-            _write(os.path.join(drv, "unbind"), ctrl["busid"])
-            time.sleep(1.5)
-            _write(os.path.join(drv, "bind"), ctrl["busid"])
-    except OSError as exc:
-        return _res(False, "%s failed: %s" % (how, exc))
-    back = wait_reenumerated(ctrl["devnum"], 12.0) or find_controller()
-    if not back:
-        return _res(False, "%s done, controller did not come back (reboot to recover)" % how)
-    wait_cfg()
-    return _res(True, "%s done, controller is back" % how, changed=True)
-
 
 def act_mcu_reset():
     """Reset the controller MCU (hid-msi 'reset' attribute).
 
-    The reset may bring the MCU back with different settings, so the gamepad
-    mode and the back-button mode are captured first and put back afterwards.
-    Rumble intensity is handled separately by act_intensity().
+    This is the software counterpart of the EC reset and the only action seen
+    to bring rumble back. The reset may bring the MCU up with other settings,
+    so they are captured first and written back when they differ.
     """
     ctrl = find_controller()
     if not ctrl:
@@ -439,7 +262,6 @@ def act_mcu_reset():
     if not os.path.exists(path):
         return _res(False, "kernel driver exposes no reset attribute")
     before = read_mcu_state(ctrl["cfg"])
-    hidden_before = not pad_exposed(ctrl)
     try:
         _write(path, 1)
     except OSError as exc:
@@ -453,6 +275,16 @@ def act_mcu_reset():
     after = read_mcu_state(back["cfg"])
     _log("MCU reset: before [%s] after [%s]" % (describe_state(before), describe_state(after)))
     notes = []
+    for name in ("rumble_intensity_left", "rumble_intensity_right"):
+        old, new = before[name], after[name]
+        if old is None or new is None or new == old or not old.isdigit():
+            continue
+        try:
+            _write(os.path.join(back["cfg"], name), old)
+            time.sleep(0.5)  # let the flash commit retire before the next command
+            notes.append("%s restored %s -> %s" % (name, new, old))
+        except OSError as exc:
+            notes.append("%s restore failed: %s" % (name, exc))
     for name, valid in (("gamepad_mode", SWITCHABLE_MODES), ("mkeys_function", MKEY_MODES)):
         old, new = before[name], after[name]
         if old not in valid or new is None or new == old:
@@ -471,28 +303,17 @@ def act_mcu_reset():
         wait_cfg()
         time.sleep(0.5)
         notes.append("%s restored %s -> %s" % (name, new, old))
-    if hidden_before:
-        notes.append("Steam may list the pad as an extra Xbox 360 controller until reboot")
     return _res(True, "MCU reset done" + ("; " + "; ".join(notes) if notes else ""),
                 changed=True)
 
 
-def act_mcu_fix(targets, pulse):
-    """The confirmed recovery: MCU reset, intensity check, optional test pulse."""
-    steps = [act_mcu_reset()]
-    if steps[0]["ok"]:
-        steps.append(act_intensity(targets, force=False))
-        if pulse:
-            steps.append(act_test_rumble())
-    return _res(all(s["ok"] for s in steps), "; ".join(s["msg"] for s in steps),
-                changed=True)
-
-
-def act_restart_inputplumber():
-    code, out = _run_cmd(["systemctl", "restart", "inputplumber.service"], 30)
-    if code != 0:
-        return _res(False, "InputPlumber restart failed: %s" % (out or code))
-    return _res(True, "InputPlumber restarted", changed=True)
+def act_fix_rumble():
+    """MCU reset followed by a test pulse so the result can be felt."""
+    reset = act_mcu_reset()
+    if not reset["ok"]:
+        return reset
+    pulse = act_test_rumble()
+    return _res(pulse["ok"], "%s; %s" % (reset["msg"], pulse["msg"]), changed=True)
 
 
 def _has_ff_rumble(event_node):
@@ -552,85 +373,6 @@ def act_test_rumble(seconds=0.6):
     except (OSError, ValueError) as exc:
         return _res(False, "rumble test failed: %s" % exc)
     return _res(False, "no rumble-capable interface found (%s mode)" % ctrl["pid_mode"])
-
-
-ACTIONS = {
-    "resend_mode": act_resend_mode,
-    "usb_reset": act_usb_reset,
-    "usb_replug": act_usb_replug,
-    "restart_inputplumber": act_restart_inputplumber,
-    "test_rumble": act_test_rumble,
-}
-
-
-def auto_fix(level, targets):
-    """Post-wake sequence for the configured automation level."""
-    ctrl = find_controller()
-    if ctrl and ctrl["cfg"]:
-        # Recorded on every wake so the history shows what the MCU state
-        # looked like before rumble was lost.
-        _log("state after wake: %s" % describe_state(read_mcu_state(ctrl["cfg"])))
-    steps = []
-    if level == "mode":
-        steps.append(act_resend_mode())
-    elif level == "usb":
-        steps.append(act_usb_reset())
-    elif level == "mcu":
-        steps.append(act_mcu_reset())
-    steps.append(act_intensity(targets, force=False))
-    return _res(all(s["ok"] for s in steps), "; ".join(s["msg"] for s in steps),
-                changed=any(s["changed"] for s in steps))
-
-
-# --------------------------------------------------------------------------
-# Kernel reset-resume quirk
-# --------------------------------------------------------------------------
-
-def quirk_param_path():
-    return os.path.join(SYS, "module/usbcore/parameters/quirks")
-
-
-def merge_quirks(current, enable):
-    """Add or remove our reset-resume entries, keeping foreign entries intact."""
-    ours = ["%s:%s:b" % (VENDOR, pid) for pid in sorted(PID_MODES)]
-    entries = [e for e in current.strip().split(",") if e and e != "(null)"]
-    entries = [e for e in entries if e.lower() not in ours]
-    if enable:
-        entries += ours
-    return ",".join(entries)
-
-
-def act_quirk(enable):
-    ctrl = find_controller()
-    try:
-        current = _read(quirk_param_path())
-    except OSError as exc:
-        return _res(False, "usbcore quirks parameter unavailable: %s" % exc)
-    present = [e.lower() for e in current.split(",")]
-    ours_present = all("%s:%s:b" % (VENDOR, pid) in present for pid in PID_MODES)
-    try:
-        if not enable:
-            if ours_present:
-                _write(quirk_param_path(), merge_quirks(current, False))
-            return _res(True, "reset-resume quirk entries removed (fully off after reboot)",
-                        changed=ours_present)
-        if ctrl and quirk_active(ctrl):
-            # Already on (built into the kernel or set earlier). The 'b' flag
-            # toggles, so adding it on top of a built-in quirk would turn it off.
-            return _res(True, "reset-resume quirk already active")
-        if not ours_present:
-            _write(quirk_param_path(), merge_quirks(current, True))
-    except OSError as exc:
-        return _res(False, "usbcore quirks write failed: %s" % exc)
-    if not ctrl:
-        return _res(True, "quirk parameter set; controller not present yet", changed=True)
-    # Quirks are evaluated at enumeration time only: force a re-enumeration.
-    replug = act_usb_replug()
-    after = find_controller()
-    if after and quirk_active(after):
-        return _res(True, "reset-resume quirk active", changed=True)
-    return _res(False, "quirk parameter set but not active on the device (%s)"
-                % replug["msg"], changed=True)
 
 
 # --------------------------------------------------------------------------
@@ -741,51 +483,26 @@ def count_flash_acks():
 # Status and diagnostics
 # --------------------------------------------------------------------------
 
-def controller_status(ctrl):
-    if not ctrl:
-        return None
-    cfg = ctrl["cfg"]
-    out = {
-        "pid": ctrl["pid"], "pid_mode": ctrl["pid_mode"], "busid": ctrl["busid"],
-        "bcd": ctrl["bcd"], "quirk_active": quirk_active(ctrl),
-        "has_cfg": bool(cfg), "has_rumble_attrs": has_rumble_attrs(cfg),
-        "has_reset": bool(cfg) and os.path.exists(os.path.join(cfg, "reset")),
-        "gamepad_mode": None, "left": None, "right": None,
-    }
-    if cfg:
-        try:
-            out["gamepad_mode"] = _read(os.path.join(cfg, "gamepad_mode"))
-        except OSError:
-            pass
-    if out["has_rumble_attrs"]:
-        try:
-            out["left"], out["right"] = read_intensity(cfg)
-        except (OSError, ValueError):
-            pass
-    return out
-
-
 def build_status():
-    ctrl = controller_status(find_controller())
-    settings = STATE.settings
-    # Adopt the hardware intensity as the target the first time we see a sane one.
-    if (ctrl and settings["target_left"] is None and ctrl["left"] is not None
-            and (ctrl["left"], ctrl["right"]) != (0, 0)):
-        settings["target_left"], settings["target_right"] = ctrl["left"], ctrl["right"]
-        save_settings()
-    raw = find_controller()
+    ctrl = find_controller()
+    controller = None
+    if ctrl:
+        state = read_mcu_state(ctrl["cfg"]) if ctrl["cfg"] else {}
+        controller = {
+            "pid": ctrl["pid"], "pid_mode": ctrl["pid_mode"], "bcd": ctrl["bcd"],
+            "has_reset": bool(ctrl["cfg"]) and os.path.exists(os.path.join(ctrl["cfg"], "reset")),
+            "state": state,
+        }
     return {
-        "controller": ctrl,
+        "controller": controller,
         "inputplumber": inputplumber_state(),
-        "pad_exposed": bool(raw) and pad_exposed(raw),
-        "flash_acks": count_flash_acks(),
-        "quiet_udev_active": os.path.exists(os.path.join(RULES_OVERRIDE_DIR, RULES_NAME)),
         "kernel": os.uname().release,
         "root": os.geteuid() == 0,
-        "settings": dict(settings),
-        "targets": list(effective_targets(settings)),
+        "quiet_udev": bool(STATE.settings["quiet_udev"]),
+        "quiet_udev_active": os.path.exists(os.path.join(RULES_OVERRIDE_DIR, RULES_NAME)),
+        "flash_acks": count_flash_acks(),
         "resume_count": STATE.resume_count,
-        "last_result": STATE.last_result,
+        "last_wake": STATE.last_wake,
         "history": ["%s  %s" % (t[11:], m) for t, m in list(STATE.history)[-8:]],
     }
 
@@ -860,10 +577,6 @@ def write_diagnostics():
         except OSError as exc:
             section(title, str(exc))
     section("decky plugins", _run_cmd(["ls", "-1", os.path.join(decky.DECKY_HOME, "plugins")], 5)[1])
-    try:
-        section("usbcore quirks", _read(quirk_param_path()))
-    except OSError as exc:
-        section("usbcore quirks", str(exc))
     _, dmesg = _run_cmd(["dmesg"], 20)
     pattern = re.compile(r"hid-msi|msi|0db0|xpad|usb \d|xhci|PM: |suspend|resume|inputplumber",
                          re.IGNORECASE)
@@ -901,8 +614,6 @@ def load_settings():
         settings.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
     except (OSError, ValueError):
         pass
-    if settings["auto_level"] not in AUTO_LEVELS:
-        settings["auto_level"] = DEFAULT_SETTINGS["auto_level"]
     STATE.settings = settings
 
 
@@ -955,27 +666,18 @@ async def _handle_resume(source, slept):
     count = STATE.resume_count
     _log("wake #%d detected via %s%s" % (
         count, source, "" if slept is None else " (slept %.0fs)" % slept))
-    asyncio.ensure_future(report_wake_commits(count, await asyncio.to_thread(count_flash_acks)))
-    level = STATE.settings["auto_level"]
-    if level == "off":
-        return
-    await asyncio.sleep(float(STATE.settings["resume_delay"]))
-    result = await _locked(auto_fix, level, effective_targets(STATE.settings))
-    STATE.last_result = "wake #%d: %s" % (count, result["msg"])
-    _log(STATE.last_result)
-    # Toast on failures, and on repairs the user did not ask for explicitly;
-    # the routine reset of the heavier levels would otherwise toast every wake.
-    if not result["ok"] or (level == "intensity" and result["changed"]):
-        await decky.emit("claw_rumble_fix_result", result["ok"], result["msg"])
-
-
-async def report_wake_commits(count, before):
-    """Log how many flash commits the controller received after a wake-up."""
-    await asyncio.sleep(45)
+    before = await asyncio.to_thread(count_flash_acks)
+    await asyncio.sleep(WAKE_SETTLE)
+    ctrl = await _locked(find_controller)
+    if ctrl and ctrl["cfg"]:
+        state = await _locked(read_mcu_state, ctrl["cfg"])
+        _log("wake #%d: controller state %s" % (count, describe_state(state)))
+    await asyncio.sleep(max(0.0, WAKE_WINDOW - WAKE_SETTLE))
     after = await asyncio.to_thread(count_flash_acks)
     if before is not None and after is not None:
-        _log("wake #%d: %d controller flash commit(s) within 45s of waking"
-             % (count, after - before))
+        STATE.last_wake = "wake #%d: %d flash commit(s) in the first %ds" % (
+            count, after - before, WAKE_WINDOW)
+        _log(STATE.last_wake)
 
 
 async def watch_resume():
@@ -997,14 +699,12 @@ async def watch_resume():
 class Plugin:
     async def _main(self):
         load_settings()
-        _log("plugin started, auto level '%s'" % STATE.settings["auto_level"])
+        _log("plugin started, redundant flash writes %s"
+             % ("blocked" if STATE.settings["quiet_udev"] else "not blocked"))
         STATE.watch_task = asyncio.ensure_future(watch_resume())
         if STATE.settings["quiet_udev"]:
             result = await _locked(act_quiet_udev, True)
             _log("startup udev override: %s" % result["msg"])
-        if STATE.settings["reset_resume_quirk"]:
-            result = await _locked(act_quirk, True)
-            _log("startup quirk: %s" % result["msg"])
 
     async def _unload(self):
         if STATE.watch_task:
@@ -1021,45 +721,14 @@ class Plugin:
     async def notify_resume(self):
         asyncio.ensure_future(handle_resume("steam"))
 
-    async def run_action(self, name):
-        targets = effective_targets(STATE.settings)
-        if name == "intensity":
-            result = await _locked(act_intensity, targets, True)
-        elif name in ("mcu_reset", "fix_now"):
-            result = await _locked(act_mcu_fix, targets, name == "fix_now")
-        elif name in ACTIONS:
-            result = await _locked(ACTIONS[name])
-        else:
-            result = _res(False, "unknown action '%s'" % name)
-        _log("manual %s: %s" % (name, result["msg"]))
+    async def fix_rumble(self):
+        result = await _locked(act_fix_rumble)
+        _log("fix rumble: %s" % result["msg"])
         return result
 
-    async def set_targets(self, left, right):
-        left, right = max(0, min(100, int(left))), max(0, min(100, int(right)))
-        STATE.settings["target_left"], STATE.settings["target_right"] = left, right
-        save_settings()
-        result = await _locked(act_intensity, (left, right), True)
-        _log("set intensity: %s" % result["msg"])
-        return result
-
-    async def set_gamepad_mode(self, mode):
-        result = await _locked(act_set_mode, mode)
-        _log("set gamepad mode: %s" % result["msg"])
-        return result
-
-    async def set_auto_level(self, level):
-        if level not in AUTO_LEVELS:
-            return _res(False, "unknown level '%s'" % level)
-        STATE.settings["auto_level"] = level
-        save_settings()
-        _log("auto level set to '%s'" % level)
-        return _res(True, "auto level: %s" % level)
-
-    async def set_quirk(self, enable):
-        STATE.settings["reset_resume_quirk"] = bool(enable)
-        save_settings()
-        result = await _locked(act_quirk, bool(enable))
-        _log("quirk %s: %s" % ("on" if enable else "off", result["msg"]))
+    async def test_rumble(self):
+        result = await _locked(act_test_rumble)
+        _log("test rumble: %s" % result["msg"])
         return result
 
     async def set_quiet_udev(self, enable):
