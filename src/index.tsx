@@ -24,6 +24,9 @@ interface Status {
   root: boolean;
   quiet_udev: boolean;
   quiet_udev_active: boolean;
+  quiet_udev_msg: string | null;
+  writers: string[];
+  trace_notes: string[];
   flash_acks: number | null;
   resume_count: number;
   last_wake: string | null;
@@ -93,9 +96,11 @@ function Content() {
           <ToggleField
             label="Stop redundant flash writes"
             description={
-              status?.quiet_udev_active
-                ? "Active: InputPlumber's udev rule only writes controller settings that actually changed."
-                : "InputPlumber rewrites unchanged settings into the controller flash after every wake-up. Suspected cause of the rumble loss."
+              status?.quiet_udev && !status.quiet_udev_active
+                ? `NOT ACTIVE: ${status.quiet_udev_msg ?? "the override could not be installed"}`
+                : status?.quiet_udev_active
+                  ? (status.quiet_udev_msg ?? "Active: udev only writes controller settings that actually changed.")
+                  : "InputPlumber rewrites unchanged settings into the controller flash after every wake-up. Suspected cause of the rumble loss."
             }
             checked={status?.quiet_udev ?? false}
             disabled={disabled}
@@ -111,6 +116,25 @@ function Content() {
             {status?.flash_acks ?? "?"}
           </Field>
         </PanelSectionRow>
+      </PanelSection>
+
+      <PanelSection title="Who writes to the controller">
+        {(status?.trace_notes ?? []).map((line, index) => (
+          <PanelSectionRow key={`note-${index}`}>
+            <Field label={line} focusable />
+          </PanelSectionRow>
+        ))}
+        {(status?.writers ?? []).length === 0 ? (
+          <PanelSectionRow>
+            <Field label="No writes seen since the plugin started" focusable />
+          </PanelSectionRow>
+        ) : (
+          (status?.writers ?? []).map((line, index) => (
+            <PanelSectionRow key={`writer-${index}`}>
+              <div style={{ fontSize: "12px", wordBreak: "break-word" }}>{line}</div>
+            </PanelSectionRow>
+          ))
+        )}
       </PanelSection>
 
       <PanelSection title="Rumble gone?">

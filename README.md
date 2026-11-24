@@ -7,19 +7,28 @@ reset (holding the power button for ~25 s) brought it back.
 
 > Status: investigated on one MSI Claw A8 (SteamOS 3.9.5, kernel 7.2.7-valve2,
 > InputPlumber 0.78.0). Resetting the controller MCU is **confirmed** to bring
-> rumble back. The prevention option targets the suspected trigger and is
-> **not confirmed yet**.
+> rumble back. The prevention option did **not** stop the flash commits on
+> that device (reason still unknown), so the suspected trigger is neither
+> confirmed nor ruled out. The plugin now records which process writes to the
+> controller to settle that.
 
 ## What it does
 
-- **Stop redundant flash writes** (prevention). Installs a runtime copy of
-  InputPlumber's udev rule in `/run/udev/rules.d` in which every controller
-  setting is only written when it differs from the wanted value. Nothing
+- **Stop redundant flash writes** (prevention). For every udev rule file in
+  `/usr/lib/udev/rules.d` that writes `hid-msi` settings, installs a runtime
+  copy in `/run/udev/rules.d` in which each setting is only written when it
+  differs from the wanted value. Rules in `/etc/udev/rules.d` cannot be
+  overridden this way and are reported instead. Nothing
   persistent is changed: the copy is regenerated from the installed rule at
   every start and is gone after a reboot once the option is off.
 - **Flash commits since boot**. Counts the controller flash commits in the
   kernel log, and how many arrive in the first 45 s after each wake-up, so the
   effect of the option above can be checked.
+- **Who writes to the controller**. Watches the controller's sysfs attributes
+  (fanotify) and lists every writer by process, e.g.
+  `12x button_m1 <- (udev-worker) (started by systemd-udevd)`. The diagnostics
+  report adds a timeline that interleaves these writes with udev events on
+  the controller and `hid-msi` / suspend messages from the kernel log.
 - **Fix rumble now** (recovery). Resets the controller MCU, writes its
   settings back if the reset changed them, and pulses the motors.
 - **Test rumble**. Drives both motors straight through the kernel, bypassing

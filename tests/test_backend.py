@@ -40,6 +40,7 @@ class Base(unittest.TestCase):
         main.SYS = self.sys
         main.DEV = "/dev"
         main.STATE = main.State()
+        main.TRACE = main.Trace()
         self.writes = []
         self._sleep = main.time.sleep
         main.time.sleep = lambda _s: None
@@ -175,7 +176,8 @@ class Diagnostics(Base):
         self.assertIn("controller evdev nodes (pad_exposed=", report)
         self.assertIn("name=Fake Pad", report)
         self.assertIn("gamepad_mode = xinput", report)
-        self.assertIn("inputplumber udev rule (installed)", report)
+        self.assertIn("activity trace", report)
+        self.assertIn("udev rules mentioning the controller", report)
 
 
 class UdevOverride(Base):
@@ -184,6 +186,7 @@ class UdevOverride(Base):
             'ATTR{button_m2}="KEY_LEFTBRACE", GOTO="claw_desktop"')
     MATCH = ('ACTION=="add|change|bind", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="190[1-3]", '
              'SUBSYSTEM=="hid", DRIVER=="hid-msi"')
+    NAME = "99-inputplumber-device-setup.rules"
 
     def setUp(self):
         super().setUp()
@@ -194,8 +197,8 @@ class UdevOverride(Base):
         main.RULES_OVERRIDE_DIR = os.path.join(tempfile.mkdtemp(), "rules.d")
         self.commands = []
         main._run_cmd = lambda args, timeout=0: (self.commands.append(args), (0, ""))[1]
-        self.source = os.path.join(main.RULES_SOURCE_DIR, main.RULES_NAME)
-        self.override = os.path.join(main.RULES_OVERRIDE_DIR, main.RULES_NAME)
+        self.source = os.path.join(main.RULES_SOURCE_DIR, self.NAME)
+        self.override = os.path.join(main.RULES_OVERRIDE_DIR, self.NAME)
 
     def tearDown(self):
         (main.RULES_SOURCE_DIR, main.RULES_ETC_DIR, main.RULES_OVERRIDE_DIR,
@@ -240,15 +243,105 @@ class UdevOverride(Base):
 
     def test_user_override_in_etc_is_respected(self):
         put(self.source, self.V078)
-        put(os.path.join(main.RULES_ETC_DIR, main.RULES_NAME), "# mine")
+        put(os.path.join(main.RULES_ETC_DIR, self.NAME), "# mine")
         self.assertFalse(main.act_quiet_udev(True)["ok"])
         self.assertFalse(os.path.exists(self.override))
+
+    def test_any_rule_file_writing_hid_msi_settings_is_overridden(self):
+        put(os.path.join(main.RULES_SOURCE_DIR, "70-vendor-claw.rules"), self.V078)
+        put(os.path.join(main.RULES_SOURCE_DIR, "50-unrelated.rules"), 'KERNEL=="sda", MODE="0660"')
+        result = main.act_quiet_udev(True)
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["70-vendor-claw.rules"])
+
+    def test_rules_in_etc_are_reported_as_unhandled(self):
+        put(self.source, self.V078)
+        put(os.path.join(main.RULES_ETC_DIR, "99-custom.rules"), self.V078)
+        result = main.act_quiet_udev(True)
+        self.assertFalse(result["ok"])
+        self.assertIn("NOT handled", result["msg"])
+        self.assertIn("99-custom.rules", result["msg"])
+        self.assertTrue(os.path.exists(self.override))  # the /usr/lib one is still handled
+
+    def test_foreign_files_in_run_are_never_removed(self):
+        foreign = os.path.join(main.RULES_OVERRIDE_DIR, "50-inputplumber-hide.rules")
+        put(foreign, 'KERNEL=="event6", MODE="0000"')
+        put(self.source, self.V078)
+        main.act_quiet_udev(True)
+        main.act_quiet_udev(False)
+        self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["50-inputplumber-hide.rules"])
 
     def test_missing_or_irrelevant_rule_file_fails_cleanly(self):
         self.assertFalse(main.act_quiet_udev(True)["ok"])
         put(self.source, "# nothing for the claw here")
         self.assertFalse(main.act_quiet_udev(True)["ok"])
         self.assertFalse(os.path.exists(self.override))
+
+
+class ActivityTrace(Base):
+    def test_fanotify_buffer_is_split_into_events(self):
+        one = main.FAN_EVENT.pack(24, 3, 0, 24, main.FAN_MODIFY, 7, 4242)
+        two = main.FAN_EVENT.pack(24, 3, 0, 24, 0x20, 8, 1)
+        self.assertEqual(main.FAN_EVENT.size, 24)
+        self.assertEqual(main.parse_fan_events(one + two + b"\x00" * 5),
+                         [(main.FAN_MODIFY, 7, 4242), (0x20, 8, 1)])
+
+    def test_kernel_log_record(self):
+        record = b"4,1234,5678901,-;hid-msi 0003:0DB0:1901.0001: Got unexpected ACK from MCU, ignoring\n SUBSYSTEM=hid\n"
+        message = main.parse_kmsg(record)
+        self.assertEqual(message, "hid-msi 0003:0DB0:1901.0001: Got unexpected ACK from MCU, ignoring")
+        self.assertTrue(main.KMSG_PATTERN.search(message))
+        self.assertTrue(main.KMSG_PATTERN.search("PM: suspend exit"))
+        self.assertFalse(main.KMSG_PATTERN.search("usb 5-1: USB disconnect"))
+
+    def test_udev_events_of_the_controller_are_logged(self):
+        trace = main.Trace()
+        trace.on_udev_block(["monitor will print the received events for:",
+                             "KERNEL - the kernel uevent"])
+        trace.on_udev_block([
+            "KERNEL[160.5] add      /devices/pci0000:00/0000:c6:00.0/usb3/3-3/3-3:1.1/0003:0DB0:1901.0001 (hid)",
+            "ACTION=add", "SYNTH_UUID=0", "SUBSYSTEM=hid"])
+        trace.on_udev_block([
+            "KERNEL[161.0] bind     /devices/virtual/misc/uhid/0003:28DE:1205.0009 (hid)", "ACTION=bind"])
+        self.assertEqual([msg for _, msg, _ in trace.events],
+                         ["udev add 0003:0DB0:1901.0001 (synthetic)"])
+
+    def test_writer_is_identified_from_proc(self):
+        saved, main.PROC = main.PROC, tempfile.mkdtemp()
+        try:
+            put(os.path.join(main.PROC, "500/comm"), "(udev-worker)")
+            put(os.path.join(main.PROC, "500/status"), "Name:\tx\nPPid:\t77\n")
+            with open(os.path.join(main.PROC, "500/cmdline"), "wb") as f:
+                f.write(b"/usr/lib/systemd/systemd-udevd\0")
+            put(os.path.join(main.PROC, "77/comm"), "systemd-udevd")
+            short, full = main.describe_pid(500)
+            self.assertEqual(short, "(udev-worker) (started by systemd-udevd)")
+            self.assertIn("(udev-worker)[500]", full)
+            self.assertEqual(main.describe_pid(999)[0], "exited process")
+            self.assertEqual(main.describe_pid(os.getpid())[0], "this plugin")
+        finally:
+            main.PROC = saved
+
+    def test_writable_controller_attributes_are_watched(self):
+        os.chmod(os.path.join(self.cfg, "gamepad_mode"), 0o644)
+        os.chmod(os.path.join(self.cfg, "reset"), 0o200)
+        put(os.path.join(self.cfg, "report_descriptor"), "x")
+        os.chmod(os.path.join(self.cfg, "report_descriptor"), 0o444)
+        put(os.path.join(self.cfg, "leds/msi_claw:rgb:joystick/multi_intensity"), "0 0 0")
+        names = {os.path.basename(path) for path, _ in main.trace_targets(main.find_controller())}
+        self.assertIn("gamepad_mode", names)
+        self.assertIn("reset", names)
+        self.assertIn("multi_intensity", names)
+        self.assertNotIn("report_descriptor", names)
+
+    def test_repeated_entries_are_coalesced(self):
+        trace = main.Trace()
+        for _ in range(3):
+            trace.add("kernel: same")
+        trace.add("other")
+        self.assertEqual([(msg, count) for _, msg, count in trace.events],
+                         [("kernel: same", 3), ("other", 1)])
+        self.assertTrue(trace.lines()[0].endswith("kernel: same  (x3)"))
 
 
 class Formats(unittest.TestCase):

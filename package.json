@@ -1,6 +1,6 @@
 {
   "name": "claw-rumble-fix",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Decky plugin that restores MSI Claw A8 rumble after suspend/resume",
   "type": "module",
   "scripts": {
