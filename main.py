@@ -50,10 +50,15 @@ FF_RUMBLE = 0x50
 
 # Window after a wake-up in which unexpected MCU ACKs are counted.
 WAKE_WINDOW = 45.0
+# Optional rumble check after a wake-up: a short pulse the user can feel.
+WAKE_BUZZ_DELAY = 2.0
+WAKE_BUZZ_SECONDS = 0.25
+DEFAULT_SETTINGS = {"wake_buzz": False}
 
 
 class State:
     def __init__(self):
+        self.settings = dict(DEFAULT_SETTINGS)
         self.history = collections.deque(maxlen=300)
         self.resume_count = 0
         self.last_handled = -1e9
@@ -664,6 +669,8 @@ class Trace:
             self.events[-1][2] += 1
             return
         self.events.append([now, msg, 1])
+        if not msg.startswith("plugin: "):  # those are logged by _log() already
+            decky.logger.info("trace: " + msg)  # survives a plugin restart
 
     def lines(self):
         out = []
@@ -843,6 +850,7 @@ def build_status():
         "unexpected_acks": count_unexpected_acks(),
         "resume_count": STATE.resume_count,
         "last_wake": STATE.last_wake,
+        "wake_buzz": bool(STATE.settings["wake_buzz"]),
         "history": ["%s  %s" % (t[11:], m) for t, m in list(STATE.history)[-8:]],
     }
 
@@ -933,6 +941,7 @@ def write_diagnostics():
                            "--no-pager", "-n", "300"], 30)
     section("inputplumber journal (last 300)", journal)
     section("plugin history", "\n".join("%s  %s" % item for item in STATE.history))
+    section("plugin log files (tail)", read_log_tail())
 
     name = "claw-rumble-fix-diag-%s.txt" % datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(decky.DECKY_USER_HOME, name)
@@ -943,6 +952,54 @@ def write_diagnostics():
     except (OSError, LookupError):
         pass
     return path
+
+
+def read_log_tail(files=3, lines=400):
+    """Tail of the newest plugin log files; they outlive plugin restarts."""
+    directory = getattr(decky, "DECKY_PLUGIN_LOG_DIR", None)
+    if not directory:
+        return "log directory unknown"
+    try:
+        paths = sorted((os.path.join(directory, name) for name in os.listdir(directory)),
+                       key=os.path.getmtime)[-files:]
+    except OSError as exc:
+        return str(exc)
+    out = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                out.append("## %s\n%s" % (path, "".join(f.readlines()[-lines:]).rstrip()))
+        except OSError as exc:
+            out.append("## %s\n%s" % (path, exc))
+    return "\n\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# Settings
+# --------------------------------------------------------------------------
+
+def settings_path():
+    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as f:
+            stored = json.load(f)
+        settings.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
+    except (OSError, ValueError, AttributeError):
+        pass
+    STATE.settings = settings
+
+
+def save_settings():
+    try:
+        os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(STATE.settings, f, indent=2)
+    except OSError as exc:
+        decky.logger.error("failed to save settings: %s" % exc)
 
 
 # --------------------------------------------------------------------------
@@ -985,9 +1042,17 @@ async def _handle_resume(source, slept):
     count = STATE.resume_count
     _log("wake #%d detected via %s%s" % (
         count, source, "" if slept is None else " (slept %.0fs)" % slept))
-    # Deliberately no controller access here: a wake-up is only observed.
     before = await asyncio.to_thread(count_unexpected_acks)
-    await asyncio.sleep(WAKE_WINDOW)
+    waited = 0.0
+    if STATE.settings["wake_buzz"]:
+        # A pulse the user can feel: its absence dates the rumble loss to
+        # this very wake-up. Nothing else touches the controller here.
+        await asyncio.sleep(WAKE_BUZZ_DELAY)
+        waited = WAKE_BUZZ_DELAY
+        result = await _locked(act_test_rumble, WAKE_BUZZ_SECONDS)
+        _log("wake #%d: check buzz %s (%s)" % (
+            count, "sent" if result["ok"] else "FAILED", result["msg"]))
+    await asyncio.sleep(max(0.0, WAKE_WINDOW - waited))
     after = await asyncio.to_thread(count_unexpected_acks)
     if before is not None and after is not None:
         STATE.last_wake = "wake #%d: %d unexpected MCU ACK(s) in the first %ds" % (
@@ -1014,7 +1079,9 @@ async def watch_resume():
 
 class Plugin:
     async def _main(self):
-        _log("plugin started")
+        load_settings()
+        _log("plugin started, wake-up check buzz %s"
+             % ("on" if STATE.settings["wake_buzz"] else "off"))
         TRACE.start(asyncio.get_event_loop())
         STATE.watch_task = asyncio.ensure_future(watch_resume())
         removed = await _locked(remove_old_overrides)
@@ -1046,6 +1113,12 @@ class Plugin:
         result = await _locked(act_test_rumble)
         _log("test rumble: %s" % result["msg"])
         return result
+
+    async def set_wake_buzz(self, enable):
+        STATE.settings["wake_buzz"] = bool(enable)
+        save_settings()
+        _log("wake-up check buzz %s" % ("on" if enable else "off"))
+        return _res(True, "wake-up check buzz %s" % ("on" if enable else "off"))
 
     async def save_diagnostics(self):
         try:

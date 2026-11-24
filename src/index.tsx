@@ -1,4 +1,11 @@
-import { ButtonItem, Field, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
+import {
+  ButtonItem,
+  Field,
+  PanelSection,
+  PanelSectionRow,
+  ToggleField,
+  staticClasses,
+} from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useCallback, useEffect, useState } from "react";
 import { MdVibration } from "react-icons/md";
@@ -20,6 +27,7 @@ interface Status {
   unexpected_acks: number | null;
   resume_count: number;
   last_wake: string | null;
+  wake_buzz: boolean;
   history: string[];
 }
 
@@ -31,6 +39,7 @@ interface Result {
 const getStatus = callable<[], Status>("get_status");
 const fixRumble = callable<[], Result>("fix_rumble");
 const testRumble = callable<[], Result>("test_rumble");
+const setWakeBuzz = callable<[enable: boolean], Result>("set_wake_buzz");
 const saveDiagnostics = callable<[], Result>("save_diagnostics");
 const notifyResume = callable<[], void>("notify_resume");
 
@@ -131,6 +140,15 @@ function Content() {
           >
             Test rumble
           </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Buzz after every wake-up"
+            description="A short pulse a few seconds after waking. No buzz means rumble died during that sleep: save a diagnostics report right away."
+            checked={status?.wake_buzz ?? false}
+            disabled={disabled}
+            onChange={(value) => run("buzz", () => setWakeBuzz(value))}
+          />
         </PanelSectionRow>
         {message && (
           <PanelSectionRow>

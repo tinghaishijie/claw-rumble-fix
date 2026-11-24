@@ -20,6 +20,7 @@ class FakeDecky(types.ModuleType):
         self.DECKY_USER_HOME = tempfile.mkdtemp()
         self.DECKY_HOME = tempfile.mkdtemp()
         self.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
+        self.DECKY_PLUGIN_LOG_DIR = tempfile.mkdtemp()
 
 
 decky = FakeDecky()
@@ -195,6 +196,7 @@ class Diagnostics(Base):
         self.assertIn("gamepad_mode = xinput", report)
         self.assertIn("activity trace", report)
         self.assertIn("MCU profile memory (now)", report)
+        self.assertIn("plugin log files (tail)", report)
 
 
 class FakeMcu(threading.Thread):
@@ -377,13 +379,18 @@ class Formats(unittest.TestCase):
 class Resume(Base):
     def setUp(self):
         super().setUp()
-        self.saved = (main.WAKE_WINDOW, main.count_unexpected_acks)
-        main.WAKE_WINDOW = 0
+        self.saved = (main.WAKE_WINDOW, main.count_unexpected_acks, main.WAKE_BUZZ_DELAY,
+                      main.act_test_rumble)
+        main.WAKE_WINDOW = main.WAKE_BUZZ_DELAY = 0
+        self.pulses = []
+        main.act_test_rumble = lambda seconds=0.6: (self.pulses.append(seconds),
+                                                    main._res(True, "pulse"))[1]
         self.acks = iter([100, 106, 106, 106])
         main.count_unexpected_acks = lambda: next(self.acks)
 
     def tearDown(self):
-        main.WAKE_WINDOW, main.count_unexpected_acks = self.saved
+        (main.WAKE_WINDOW, main.count_unexpected_acks, main.WAKE_BUZZ_DELAY,
+         main.act_test_rumble) = self.saved
         super().tearDown()
 
     def test_wake_is_counted_once_and_only_observed(self):
@@ -395,6 +402,31 @@ class Resume(Base):
         self.assertEqual(main.STATE.resume_count, 1)
         self.assertEqual(self.writes, [])  # a wake-up never touches the controller
         self.assertIn("6 unexpected MCU ACK(s)", main.STATE.last_wake)
+        self.assertEqual(self.pulses, [])  # the check buzz is opt-in
+
+    def test_opt_in_check_buzz_after_wake(self):
+        main.STATE.settings["wake_buzz"] = True
+        asyncio.run(main.handle_resume("clock", 30.0))
+        self.assertEqual(self.pulses, [main.WAKE_BUZZ_SECONDS])
+        history = " | ".join(msg for _, msg in main.STATE.history)
+        self.assertIn("wake #1: check buzz sent", history)
+
+    def test_failed_check_buzz_is_logged(self):
+        main.STATE.settings["wake_buzz"] = True
+        main.act_test_rumble = lambda seconds=0.6: main._res(False, "controller not found on USB")
+        asyncio.run(main.handle_resume("clock", 30.0))
+        history = " | ".join(msg for _, msg in main.STATE.history)
+        self.assertIn("check buzz FAILED (controller not found on USB)", history)
+
+    def test_setting_survives_a_restart(self):
+        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
+        asyncio.run(main.Plugin().set_wake_buzz(True))
+        main.STATE = main.State()
+        main.load_settings()
+        self.assertTrue(main.STATE.settings["wake_buzz"])
+        put(main.settings_path(), '{"wake_buzz": true, "quiet_udev": true}')
+        main.load_settings()
+        self.assertEqual(main.STATE.settings, {"wake_buzz": True})
 
 
 if __name__ == "__main__":

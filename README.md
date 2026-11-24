@@ -19,6 +19,9 @@ reset (holding the power button for ~25 s) brought it back.
   find out what the reset actually repairs.
 - **Test rumble**. Drives both motors straight through the kernel, bypassing
   InputPlumber and Steam Input.
+- **Buzz after every wake-up** (optional, off by default). Sends a short pulse
+  two seconds after each wake-up. A missing buzz dates the rumble loss to that
+  very sleep, so a report saved right then shows what happened around it.
 - **Unexpected MCU ACKs**. Counts `hid-msi: Got unexpected ACK from MCU` lines
   in the kernel log, in total and for the first 45 s after each wake-up. Each
   one is the MCU answering a command the kernel driver did not send, or one
@@ -29,8 +32,9 @@ reset (holding the power button for ~25 s) brought it back.
   the home folder with the controller state, the profile memory, a timeline
   of writes, udev events and kernel messages, and the InputPlumber journal.
 
-The plugin does not touch the controller on its own. After a wake-up it only
-reads the kernel log.
+The plugin does not touch the controller on its own, except for that optional
+buzz. After a wake-up it otherwise only reads the kernel log. The timeline is
+also written to the plugin's log file, so it survives a plugin restart.
 
 ## Findings
 
@@ -62,9 +66,11 @@ exactly: a pair of unexpected ACKs 5.7 s after each `PM: suspend exit`, then
 usually two more pairs.
 
 That explains the kernel messages. Whether these writes are what eventually
-breaks rumble is **unproven**. To test it, disable HueSync for a few days:
-the ACK counter should stay flat after wake-ups right away, and if the
-suspicion is right rumble should stop disappearing.
+breaks rumble is **unproven**. The direct test would be to run without
+HueSync for a few days; that has not been done. Instead the plugin collects
+evidence with HueSync running: which wake-up loses rumble (the optional
+buzz), what happened around it (the timeline), and what the MCU reset
+changes in the profile memory.
 
 ### Side effect of the MCU reset
 
