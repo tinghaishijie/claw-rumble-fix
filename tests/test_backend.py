@@ -1,11 +1,8 @@
 """Backend tests against a fake sysfs tree (no hardware required)."""
-import asyncio
 import os
-import socket
 import struct
 import sys
 import tempfile
-import threading
 import types
 import unittest
 
@@ -43,7 +40,6 @@ class Base(unittest.TestCase):
         main.SYS = self.sys
         main.DEV = "/dev"
         main.STATE = main.State()
-        main.TRACE = main.Trace()
         self.writes = []
         self._sleep = main.time.sleep
         main.time.sleep = lambda _s: None
@@ -78,21 +74,18 @@ class Base(unittest.TestCase):
 class Discovery(Base):
     def test_finds_controller_and_config_interface(self):
         ctrl = main.find_controller()
-        self.assertEqual(ctrl["busid"], "3-3")
-        self.assertEqual(ctrl["pid_mode"], "xinput")
-        self.assertEqual(ctrl["cfg"], self.cfg)
+        self.assertEqual((ctrl["busid"], ctrl["pid_mode"], ctrl["cfg"]),
+                         ("3-3", "xinput", self.cfg))
 
     def test_absent_controller(self):
-        put(os.path.join(self.usb, "idVendor"), "045e")
+        put(os.path.join(self.usb, "idVendor"), "1234")
         self.assertIsNone(main.find_controller())
         self.assertIsNone(main.build_status()["controller"])
 
-    def test_status_reports_controller_state(self):
-        status = main.build_status()
-        self.assertTrue(status["controller"]["has_reset"])
-        self.assertEqual(status["controller"]["state"]["gamepad_mode"], "xinput")
-        self.assertEqual(status["controller"]["state"]["rumble_intensity_left"], "50")
-        self.assertIn("unexpected_acks", status)
+    def test_status_says_whether_a_reset_is_possible(self):
+        self.assertTrue(main.build_status()["controller"]["can_reset"])
+        os.unlink(os.path.join(self.cfg, "reset"))
+        self.assertFalse(main.build_status()["controller"]["can_reset"])
 
 
 class McuReset(Base):
@@ -109,55 +102,110 @@ class McuReset(Base):
                     put(os.path.join(self.cfg, name), new)
 
         main._write = write_with_mcu
-        self._wait = main.wait_reenumerated
+        self._saved = (main.wait_reenumerated, main.inputplumber_active, main._run_cmd,
+                       main.RULES_DIR)
         main.wait_reenumerated = lambda devnum, timeout=0: main.find_controller()
+        main.inputplumber_active = lambda: False
+        main._run_cmd = lambda args, timeout=20: (0, "")
+        main.RULES_DIR = tempfile.mkdtemp()
 
     def tearDown(self):
-        main.wait_reenumerated = self._wait
+        (main.wait_reenumerated, main.inputplumber_active, main._run_cmd,
+         main.RULES_DIR) = self._saved
         super().tearDown()
 
     def test_reset_that_keeps_settings_writes_nothing_else(self):
-        result = main.act_mcu_reset()
+        result = main.mcu_reset()
         self.assertTrue(result["ok"], result["msg"])
         self.assertEqual([name for name, _ in self.writes], [os.path.relpath(
             os.path.join(self.cfg, "reset"), self.sys)])
 
     def test_reset_puts_changed_settings_back(self):
-        self.after_reset = {"mkeys_function": "macro", "rumble_intensity_left": "100",
-                            "gamepad_mode": "dinput"}
-        result = main.act_mcu_reset()
+        self.after_reset = {"mkeys_function": "macro", "gamepad_mode": "dinput"}
+        result = main.mcu_reset()
         self.assertTrue(result["ok"], result["msg"])
         self.assertEqual(self.attr("mkeys_function"), "combination")
         self.assertEqual(self.attr("gamepad_mode"), "xinput")
-        self.assertEqual(self.attr("rumble_intensity_left"), "50")
         self.assertIn("mkeys_function restored macro -> combination", result["msg"])
 
     def test_missing_reset_attribute_fails_cleanly(self):
         os.unlink(os.path.join(self.cfg, "reset"))
-        result = main.act_fix_rumble()
+        result = main.mcu_reset()
         self.assertFalse(result["ok"])
         self.assertEqual(self.writes, [])
 
-    def test_fix_reports_a_failed_test_pulse(self):
-        # No rumble-capable node in the fake tree: the reset works, the pulse cannot.
-        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
-        result = main.act_fix_rumble()
-        self.assertFalse(result["ok"])
-        self.assertIn("MCU reset done", result["msg"])
-        self.assertIn("profile memory not captured", result["msg"])
-        self.assertEqual(len(main.load_fix_records()), 1)
+    def test_hidden_pad_stays_hidden_during_the_reset(self):
+        # A hidden pad plus a running InputPlumber: the temporary rules must be
+        # in place while the controller re-enumerates and gone afterwards.
+        main.DEV = tempfile.mkdtemp()
+        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
+        put(os.path.join(event, "device/capabilities/abs"), "3003f")
+        node = os.path.join(main.DEV, "input/event7")
+        put(node, "")
+        os.chmod(node, 0)
+        put(os.path.join(main.RULES_DIR, "50-inputplumber-hide-event7-early.rules"),
+            'KERNELS=="input20"')
+        main.inputplumber_active = lambda: True
+        seen = []
+        main.wait_reenumerated = lambda devnum, timeout=0: (
+            seen.append(sorted(n for n in os.listdir(main.RULES_DIR) if "claw" in n)),
+            main.find_controller())[1]
+        result = main.mcu_reset()
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(seen, [sorted(main.HIDE_RULES)])
+        self.assertEqual([n for n in os.listdir(main.RULES_DIR) if "claw" in n], [])
+        self.assertNotIn("extra", result["msg"])
 
-    def test_fix_records_what_the_reset_changed(self):
-        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
-        dumps = iter([(bytes([1, 2, 3, 4]), None), (bytes([1, 9, 9, 4]), None)])
-        saved, main.capture_profile = main.capture_profile, lambda: next(dumps)
+    def test_visible_pad_after_the_reset_is_reported(self):
+        main.DEV = tempfile.mkdtemp()
+        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
+        put(os.path.join(event, "device/capabilities/abs"), "3003f")
+        node = os.path.join(main.DEV, "input/event7")
+        put(node, "")
+        os.chmod(node, 0)
+        main.inputplumber_active = lambda: True
+        main.wait_reenumerated = lambda devnum, timeout=0: (
+            os.chmod(node, 0o660), main.find_controller())[1]
+        clock = iter(range(0, 10000, 3))
+        saved, main.time.monotonic = main.time.monotonic, lambda: next(clock)
         try:
-            result = main.act_fix_rumble()
+            result = main.mcu_reset()
         finally:
-            main.capture_profile = saved
-        self.assertIn("reset changed 1 profile range(s): 0x0001-0x0002", result["msg"])
-        record = main.load_fix_records()[-1]
-        self.assertEqual((record["before"], record["after"]), ("01020304", "01090904"))
+            main.time.monotonic = saved
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertIn("extra Xbox 360 controller", result["msg"])
+
+
+class Capture(Base):
+    def test_fix_captures_before_and_after_even_without_hardware_access(self):
+        # No usbmon, hidraw or EC here: every probe fails, the fix still runs
+        # and both records are written.
+        saved = (main.wait_reenumerated, main.inputplumber_active, main._run_cmd)
+        main.wait_reenumerated = lambda devnum, timeout=0: main.find_controller()
+        main.inputplumber_active = lambda: False
+        main._run_cmd = lambda args, timeout=20: (1, "")
+        decky.DECKY_USER_HOME = tempfile.mkdtemp()
+        try:
+            result = main.fix_rumble()
+        finally:
+            main.wait_reenumerated, main.inputplumber_active, main._run_cmd = saved
+        self.assertTrue(result["ok"], result["msg"])
+        files = sorted(os.listdir(result["capture"]))
+        self.assertEqual(files, ["1-before-reset.txt", "2-after-reset.txt"])
+        text = main._read_quiet(os.path.join(result["capture"], files[0]))
+        self.assertIn("mode=xinput mkeys=macro intensity=L50/R50", text)
+        self.assertIn("FAILED", text)
+        self.assertEqual(main.build_status()["captures"], 1)
+
+    def test_hexdump(self):
+        self.assertEqual(main.hexdump(bytes(range(18))),
+                         "0000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n0010: 10 11")
+
+    def test_hide_rules_match_the_pad_only(self):
+        for text in main.HIDE_RULES.values():
+            self.assertIn('ATTRS{id/vendor}=="0db0"', text)
+            self.assertIn('ATTRS{capabilities/abs}!="0"', text)  # not the keyboard node
+            self.assertTrue(text.endswith("\n"))
 
 
 class Exposure(Base):
@@ -183,184 +231,6 @@ class Exposure(Base):
         self.assertFalse(main.pad_exposed(main.find_controller()))
 
 
-class Diagnostics(Base):
-    def test_report_is_written_without_system_tools(self):
-        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
-        put(os.path.join(event, "device/capabilities/abs"), "3003f")
-        put(os.path.join(event, "device/name"), "Fake Pad")
-        path = main.write_diagnostics()
-        with open(path) as f:
-            report = f.read()
-        self.assertIn("controller evdev nodes (pad_exposed=", report)
-        self.assertIn("name=Fake Pad", report)
-        self.assertIn("gamepad_mode = xinput", report)
-        self.assertIn("activity trace", report)
-        self.assertIn("MCU profile memory (now)", report)
-        self.assertIn("plugin log files (tail)", report)
-
-
-class FakeMcu(threading.Thread):
-    """Answers READ_PROFILE requests on one end of a datagram socket pair."""
-
-    def __init__(self, sock, memory, silent_at=()):
-        super().__init__(daemon=True)
-        self.sock, self.memory, self.silent_at = sock, memory, set(silent_at)
-        self.requests = []
-
-    def run(self):
-        while True:
-            try:
-                req = self.sock.recv(64)
-            except OSError:
-                return
-            if not req:
-                return
-            addr, length = (req[6] << 8) | req[7], req[8]
-            self.requests.append(addr)
-            if addr in self.silent_at:
-                continue
-            # An unrelated input report first: it must be skipped.
-            self.sock.send(bytes([0x10, 0, 0, 0x3C, 0x06]).ljust(64, b"\0"))
-            self.sock.send((bytes([0x10, 0, 0, 0x3C, 0x05, 0x01, req[6], req[7], length])
-                            + self.memory[addr:addr + length]).ljust(64, b"\0"))
-
-
-class Profile(Base):
-    def setUp(self):
-        super().setUp()
-        self.memory = bytes((i * 7) & 0xFF for i in range(main.PROFILE_END))
-        self.host, self.device = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-
-    def tearDown(self):
-        self.host.close()
-        self.device.close()
-        super().tearDown()
-
-    def test_request_and_reply_format(self):
-        request = main.profile_request(0x024A, 0x20)
-        self.assertEqual(request[:9], bytes([0x0F, 0, 0, 0x3C, 0x04, 0x01, 0x02, 0x4A, 0x20]))
-        self.assertEqual(len(request), 64)
-        reply = bytes([0x10, 0, 0, 0x3C, 0x05, 0x01, 0x02, 0x4A, 3, 9, 8, 7, 0, 0])
-        self.assertEqual(main.parse_profile_reply(reply, 0x024A), bytes([9, 8, 7]))
-        self.assertIsNone(main.parse_profile_reply(reply, 0x0022))             # other address
-        self.assertIsNone(main.parse_profile_reply(b"\x10\0\0\x3c\x06" + reply[5:], 0x024A))
-
-    def test_whole_profile_is_read_through_the_fake_mcu(self):
-        mcu = FakeMcu(self.device, self.memory)
-        mcu.start()
-        self.assertEqual(main.read_profile_fd(self.host.fileno(), timeout=1.0), self.memory)
-        self.assertEqual(mcu.requests, list(range(0, main.PROFILE_END, main.PROFILE_CHUNK)))
-
-    def test_silent_mcu_is_reported_not_hung(self):
-        FakeMcu(self.device, self.memory, silent_at=[0x40]).start()
-        with self.assertRaises(OSError) as caught:
-            main.read_profile_fd(self.host.fileno(), timeout=0.05)
-        self.assertIn("0x0040", str(caught.exception))
-
-    def test_diff_reports_ranges(self):
-        new = bytearray(self.memory)
-        new[0x22] ^= 0xFF
-        new[0x23] ^= 0xFF
-        new[0x100] ^= 0x01
-        lines = main.diff_profiles(self.memory, bytes(new))
-        self.assertEqual(len(lines), 2)
-        self.assertTrue(lines[0].startswith("0x0022-0x0023: "))
-        self.assertTrue(lines[1].startswith("0x0100-0x0100: "))
-        self.assertEqual(main.diff_profiles(self.memory, self.memory), [])
-
-    def test_fix_records_are_kept_and_capped(self):
-        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
-        for index in range(12):
-            main.save_fix_record({"time": str(index), "before": "00", "after": "01", "error": None})
-        records = main.load_fix_records()
-        self.assertEqual(len(records), 10)
-        self.assertEqual(records[-1]["time"], "11")
-
-    def test_capture_failure_never_raises(self):
-        profile, error = main.capture_profile()   # fake tree has no hidraw node
-        self.assertIsNone(profile)
-        self.assertIn("hidraw", error)
-
-
-class ActivityTrace(Base):
-    def test_fanotify_buffer_is_split_into_events(self):
-        one = main.FAN_EVENT.pack(24, 3, 0, 24, main.FAN_MODIFY, 7, 4242)
-        two = main.FAN_EVENT.pack(24, 3, 0, 24, 0x20, 8, 1)
-        self.assertEqual(main.FAN_EVENT.size, 24)
-        self.assertEqual(main.parse_fan_events(one + two + b"\x00" * 5),
-                         [(main.FAN_MODIFY, 7, 4242), (0x20, 8, 1)])
-
-    def test_kernel_log_record(self):
-        record = b"4,1234,5678901,-;hid-msi 0003:0DB0:1901.0001: Got unexpected ACK from MCU, ignoring\n SUBSYSTEM=hid\n"
-        message = main.parse_kmsg(record)
-        self.assertEqual(message, "hid-msi 0003:0DB0:1901.0001: Got unexpected ACK from MCU, ignoring")
-        self.assertTrue(main.KMSG_PATTERN.search(message))
-        self.assertTrue(main.KMSG_PATTERN.search("PM: suspend exit"))
-        self.assertFalse(main.KMSG_PATTERN.search("usb 5-1: USB disconnect"))
-
-    def test_udev_events_of_the_controller_are_logged(self):
-        trace = main.Trace()
-        trace.on_udev_block(["monitor will print the received events for:",
-                             "KERNEL - the kernel uevent"])
-        trace.on_udev_block([
-            "KERNEL[160.5] add      /devices/pci0000:00/0000:c6:00.0/usb3/3-3/3-3:1.1/0003:0DB0:1901.0001 (hid)",
-            "ACTION=add", "SYNTH_UUID=0", "SUBSYSTEM=hid"])
-        trace.on_udev_block([
-            "KERNEL[161.0] bind     /devices/virtual/misc/uhid/0003:28DE:1205.0009 (hid)", "ACTION=bind"])
-        self.assertEqual([msg for _, msg, _ in trace.events],
-                         ["udev add 0003:0DB0:1901.0001 (synthetic)"])
-
-    def test_writer_is_identified_from_proc(self):
-        saved, main.PROC = main.PROC, tempfile.mkdtemp()
-        try:
-            put(os.path.join(main.PROC, "500/comm"), "(udev-worker)")
-            put(os.path.join(main.PROC, "500/status"), "Name:\tx\nPPid:\t77\n")
-            with open(os.path.join(main.PROC, "500/cmdline"), "wb") as f:
-                f.write(b"/usr/lib/systemd/systemd-udevd\0")
-            put(os.path.join(main.PROC, "77/comm"), "systemd-udevd")
-            short, full = main.describe_pid(500)
-            self.assertEqual(short, "(udev-worker) (started by systemd-udevd)")
-            self.assertIn("(udev-worker)[500]", full)
-            self.assertEqual(main.describe_pid(999)[0], "exited process")
-            self.assertEqual(main.describe_pid(os.getpid())[0], "this plugin")
-        finally:
-            main.PROC = saved
-
-    def test_writable_controller_attributes_are_watched(self):
-        os.chmod(os.path.join(self.cfg, "gamepad_mode"), 0o644)
-        os.chmod(os.path.join(self.cfg, "reset"), 0o200)
-        put(os.path.join(self.cfg, "report_descriptor"), "x")
-        os.chmod(os.path.join(self.cfg, "report_descriptor"), 0o444)
-        put(os.path.join(self.cfg, "leds/msi_claw:rgb:joystick/multi_intensity"), "0 0 0")
-        names = {os.path.basename(path) for path, _ in main.trace_targets(main.find_controller())}
-        self.assertIn("gamepad_mode", names)
-        self.assertIn("reset", names)
-        self.assertIn("multi_intensity", names)
-        self.assertNotIn("report_descriptor", names)
-
-    def test_leftover_udev_overrides_are_removed(self):
-        saved = (main.RULES_OVERRIDE_DIR, main._run_cmd)
-        main.RULES_OVERRIDE_DIR = tempfile.mkdtemp()
-        main._run_cmd = lambda args, timeout=0: (0, "")
-        try:
-            put(os.path.join(main.RULES_OVERRIDE_DIR, "99-x.rules"),
-                "# Generated by Claw Rumble Fix from /usr/lib/...\nrule")
-            put(os.path.join(main.RULES_OVERRIDE_DIR, "50-foreign.rules"), "rule")
-            self.assertEqual(main.remove_old_overrides(), 1)
-            self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["50-foreign.rules"])
-        finally:
-            main.RULES_OVERRIDE_DIR, main._run_cmd = saved
-
-    def test_repeated_entries_are_coalesced(self):
-        trace = main.Trace()
-        for _ in range(3):
-            trace.add("kernel: same")
-        trace.add("other")
-        self.assertEqual([(msg, count) for _, msg, count in trace.events],
-                         [("kernel: same", 3), ("other", 1)])
-        self.assertTrue(trace.lines()[0].endswith("kernel: same  (x3)"))
-
-
 class Formats(unittest.TestCase):
     def test_kernel_struct_sizes(self):
         self.assertEqual(struct.calcsize("=HhHHHHH2xHH28x"), 48)  # struct ff_effect
@@ -374,60 +244,6 @@ class Formats(unittest.TestCase):
         self.assertTrue(main._has_ff_rumble(root))
         put(os.path.join(root, "device/capabilities/ff"), "0")
         self.assertFalse(main._has_ff_rumble(root))
-
-
-class Resume(Base):
-    def setUp(self):
-        super().setUp()
-        self.saved = (main.WAKE_WINDOW, main.count_unexpected_acks, main.WAKE_BUZZ_DELAY,
-                      main.act_test_rumble)
-        main.WAKE_WINDOW = main.WAKE_BUZZ_DELAY = 0
-        self.pulses = []
-        main.act_test_rumble = lambda seconds=0.6: (self.pulses.append(seconds),
-                                                    main._res(True, "pulse"))[1]
-        self.acks = iter([100, 106, 106, 106])
-        main.count_unexpected_acks = lambda: next(self.acks)
-
-    def tearDown(self):
-        (main.WAKE_WINDOW, main.count_unexpected_acks, main.WAKE_BUZZ_DELAY,
-         main.act_test_rumble) = self.saved
-        super().tearDown()
-
-    def test_wake_is_counted_once_and_only_observed(self):
-        async def scenario():
-            await main.handle_resume("clock", 30.0)
-            await main.handle_resume("steam")  # duplicate report of the same wake
-
-        asyncio.run(scenario())
-        self.assertEqual(main.STATE.resume_count, 1)
-        self.assertEqual(self.writes, [])  # a wake-up never touches the controller
-        self.assertIn("6 unexpected MCU ACK(s)", main.STATE.last_wake)
-        self.assertEqual(self.pulses, [])  # the check buzz is opt-in
-
-    def test_opt_in_check_buzz_after_wake(self):
-        main.STATE.settings["wake_buzz"] = True
-        asyncio.run(main.handle_resume("clock", 30.0))
-        self.assertEqual(self.pulses, [main.WAKE_BUZZ_SECONDS])
-        history = " | ".join(msg for _, msg in main.STATE.history)
-        self.assertIn("wake #1: check buzz sent", history)
-
-    def test_failed_check_buzz_is_logged(self):
-        main.STATE.settings["wake_buzz"] = True
-        main.act_test_rumble = lambda seconds=0.6: main._res(False, "controller not found on USB")
-        asyncio.run(main.handle_resume("clock", 30.0))
-        history = " | ".join(msg for _, msg in main.STATE.history)
-        self.assertIn("check buzz FAILED (controller not found on USB)", history)
-
-    def test_setting_survives_a_restart(self):
-        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
-        asyncio.run(main.Plugin().set_wake_buzz(True))
-        main.STATE = main.State()
-        main.load_settings()
-        self.assertTrue(main.STATE.settings["wake_buzz"])
-        put(main.settings_path(), '{"wake_buzz": true, "quiet_udev": true}')
-        main.load_settings()
-        self.assertEqual(main.STATE.settings, {"wake_buzz": True})
-
 
 if __name__ == "__main__":
     unittest.main()
