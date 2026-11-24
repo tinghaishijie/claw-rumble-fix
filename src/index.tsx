@@ -1,11 +1,4 @@
-import {
-  ButtonItem,
-  Field,
-  PanelSection,
-  PanelSectionRow,
-  ToggleField,
-  staticClasses,
-} from "@decky/ui";
+import { ButtonItem, Field, PanelSection, PanelSectionRow, staticClasses } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useCallback, useEffect, useState } from "react";
 import { MdVibration } from "react-icons/md";
@@ -22,12 +15,9 @@ interface Status {
   inputplumber: string;
   kernel: string;
   root: boolean;
-  quiet_udev: boolean;
-  quiet_udev_active: boolean;
-  quiet_udev_msg: string | null;
   writers: string[];
   trace_notes: string[];
-  flash_acks: number | null;
+  unexpected_acks: number | null;
   resume_count: number;
   last_wake: string | null;
   history: string[];
@@ -41,7 +31,6 @@ interface Result {
 const getStatus = callable<[], Status>("get_status");
 const fixRumble = callable<[], Result>("fix_rumble");
 const testRumble = callable<[], Result>("test_rumble");
-const setQuietUdev = callable<[enable: boolean], Result>("set_quiet_udev");
 const saveDiagnostics = callable<[], Result>("save_diagnostics");
 const notifyResume = callable<[], void>("notify_resume");
 
@@ -82,7 +71,7 @@ function Content() {
 
   return (
     <>
-      <PanelSection title="Prevention">
+      <PanelSection title="Who writes to the controller">
         {status && !status.root && (
           <PanelSectionRow>
             <Field
@@ -93,32 +82,17 @@ function Content() {
           </PanelSectionRow>
         )}
         <PanelSectionRow>
-          <ToggleField
-            label="Stop redundant flash writes"
-            description={
-              status?.quiet_udev && !status.quiet_udev_active
-                ? `NOT ACTIVE: ${status.quiet_udev_msg ?? "the override could not be installed"}`
-                : status?.quiet_udev_active
-                  ? (status.quiet_udev_msg ?? "Active: udev only writes controller settings that actually changed.")
-                  : "InputPlumber rewrites unchanged settings into the controller flash after every wake-up. Suspected cause of the rumble loss."
-            }
-            checked={status?.quiet_udev ?? false}
-            disabled={disabled}
-            onChange={(value) => run("quiet", () => setQuietUdev(value))}
-          />
-        </PanelSectionRow>
-        <PanelSectionRow>
           <Field
-            label="Flash commits since boot"
-            description={status?.last_wake ?? "Counted from the kernel log."}
+            label="Unexpected MCU ACKs since boot"
+            description={
+              status?.last_wake ??
+              "Commands sent to the controller behind the kernel driver's back (kernel log)."
+            }
             focusable
           >
-            {status?.flash_acks ?? "?"}
+            {status?.unexpected_acks ?? "?"}
           </Field>
         </PanelSectionRow>
-      </PanelSection>
-
-      <PanelSection title="Who writes to the controller">
         {(status?.trace_notes ?? []).map((line, index) => (
           <PanelSectionRow key={`note-${index}`}>
             <Field label={line} focusable />
@@ -142,7 +116,7 @@ function Content() {
           <ButtonItem
             layout="below"
             disabled={disabled || !ctrl?.has_reset}
-            description="Resets the controller MCU and pulses the motors. Steam may then list an extra Xbox 360 controller until you reboot."
+            description="Resets the controller MCU, records what the reset changed, and pulses the motors. Steam may then list an extra Xbox 360 controller until you reboot."
             onClick={() => run("fix", fixRumble)}
           >
             {busy === "fix" ? "Working..." : "Fix rumble now"}

@@ -7,67 +7,64 @@ reset (holding the power button for ~25 s) brought it back.
 
 > Status: investigated on one MSI Claw A8 (SteamOS 3.9.5, kernel 7.2.7-valve2,
 > InputPlumber 0.78.0). Resetting the controller MCU is **confirmed** to bring
-> rumble back. The prevention option did **not** stop the flash commits on
-> that device (reason still unknown), so the suspected trigger is neither
-> confirmed nor ruled out. The plugin now records which process writes to the
-> controller to settle that.
+> rumble back. What breaks rumble is **not established**; the current suspect
+> is another plugin sending raw commands to the controller after every
+> wake-up (see [Findings](#findings)).
 
 ## What it does
 
-- **Stop redundant flash writes** (prevention). For every udev rule file in
-  `/usr/lib/udev/rules.d` that writes `hid-msi` settings, installs a runtime
-  copy in `/run/udev/rules.d` in which each setting is only written when it
-  differs from the wanted value. Rules in `/etc/udev/rules.d` cannot be
-  overridden this way and are reported instead. Nothing
-  persistent is changed: the copy is regenerated from the installed rule at
-  every start and is gone after a reboot once the option is off.
-- **Flash commits since boot**. Counts the controller flash commits in the
-  kernel log, and how many arrive in the first 45 s after each wake-up, so the
-  effect of the option above can be checked.
-- **Who writes to the controller**. Watches the controller's sysfs attributes
-  (fanotify) and lists every writer by process, e.g.
-  `12x button_m1 <- (udev-worker) (started by systemd-udevd)`. The diagnostics
-  report adds a timeline that interleaves these writes with udev events on
-  the controller and `hid-msi` / suspend messages from the kernel log.
-- **Fix rumble now** (recovery). Resets the controller MCU, writes its
-  settings back if the reset changed them, and pulses the motors.
+- **Fix rumble now**. Resets the controller MCU, writes its settings back if
+  the reset changed them, and pulses the motors. It also reads the MCU's
+  profile memory before and after the reset and records the difference, to
+  find out what the reset actually repairs.
 - **Test rumble**. Drives both motors straight through the kernel, bypassing
   InputPlumber and Steam Input.
-- **Save diagnostics report**. Writes `~/claw-rumble-fix-diag-<timestamp>.txt`
-  with the controller state, input device nodes, filtered kernel log,
-  InputPlumber journal and rules, and the plugin's wake-up history.
+- **Unexpected MCU ACKs**. Counts `hid-msi: Got unexpected ACK from MCU` lines
+  in the kernel log, in total and for the first 45 s after each wake-up. Each
+  one is the MCU answering a command the kernel driver did not send, or one
+  of the driver's own flash commits.
+- **Who writes to the controller**. Lists every process that writes to the
+  controller's sysfs settings (fanotify).
+- **Save diagnostics report**. Writes a `claw-rumble-fix-diag-*.txt` file to
+  the home folder with the controller state, the profile memory, a timeline
+  of writes, udev events and kernel messages, and the InputPlumber journal.
 
-The plugin never writes to the controller on its own. After a wake-up it only
-reads the controller state and the kernel log.
+The plugin does not touch the controller on its own. After a wake-up it only
+reads the kernel log.
 
 ## Findings
 
 While rumble is dead:
 
-- the USB link is healthy (no disconnects or errors across ~19 suspends),
+- the USB link is healthy (no disconnects or errors across dozens of suspends),
 - the gamepad mode and the stored rumble intensity are unchanged,
 - the kernel accepts rumble commands, but the motors stay silent.
 
-So the controller MCU itself is in a bad state. Of everything tried, only the
-MCU reset (hid-msi `reset` attribute) revived rumble. These did **not** help:
-rewriting the rumble intensity, re-sending the gamepad mode, a USB port reset,
-a hub port power cycle, restarting InputPlumber.
+So the controller MCU itself is in a bad state. Only the MCU reset (hid-msi
+`reset` attribute) revived rumble. These did **not** help: rewriting the
+rumble intensity, re-sending the gamepad mode, a USB port reset, a hub port
+power cycle, restarting InputPlumber.
 
-### Suspected trigger
+### Ruled out: InputPlumber's udev rule
 
-The kernel log shows a burst of `hid-msi: Got unexpected ACK from MCU` after
-every wake-up, roughly 170 in two days. Each one is the MCU acknowledging a
-**flash commit**. They come from InputPlumber's udev rule
-(`99-inputplumber-device-setup.rules`), which assigns `button_m1` and
-`button_m2` on every add/change/bind event of the `hid-msi` device whether or
-not the value changed; the kernel driver commits the controller flash on each
-assignment. Upstream fixed a related hazard in the kernel
-([OpenGamingCollective/linux#133](https://github.com/OpenGamingCollective/linux/pull/133)),
-which is not in the SteamOS kernel tested here.
+An earlier version blamed the rule in `99-inputplumber-device-setup.rules`
+that rewrites the back-button mappings on every device event, and overrode
+it. With the override verified active, the kernel messages after each wake-up
+did not change and rumble was lost again. That option has been removed.
 
-This is a correlation, not a proven cause. With **Stop redundant flash
-writes** on, the counter should stop growing after wake-ups; if the theory
-holds, rumble should stop disappearing.
+### Current suspect: raw RGB commands from HueSync
+
+The affected device runs the [HueSync](https://github.com/honjow/huesync)
+plugin. For the Claw it writes RGB data straight to the controller's hidraw
+node (profile write command `0x21`), bypassing `hid-msi`. Five seconds after
+every resume it re-applies its settings, which matches the kernel log
+exactly: a pair of unexpected ACKs 5.7 s after each `PM: suspend exit`, then
+usually two more pairs.
+
+That explains the kernel messages. Whether these writes are what eventually
+breaks rumble is **unproven**. To test it, disable HueSync for a few days:
+the ACK counter should stay flat after wake-ups right away, and if the
+suspicion is right rumble should stop disappearing.
 
 ### Side effect of the MCU reset
 
@@ -101,11 +98,11 @@ If the plugin does not show up, check the loader log:
 ## Requirements and limits
 
 - Needs the in-kernel `hid-msi` driver with its sysfs attributes (present in
-  SteamOS 3.9.5) and InputPlumber's udev rule file.
-- The backend runs as root (sysfs writes, udev rules, kernel log).
+  SteamOS 3.9.5).
+- The backend runs as root (sysfs writes, hidraw access, kernel log).
 - The plugin never performs an EC reset and never touches firmware.
-- If `/etc/udev/rules.d` already overrides InputPlumber's rule file, the
-  prevention option leaves it alone and reports that.
+- Reading the profile memory sends read-only commands to the MCU through
+  hidraw. It only happens when you press *Fix rumble now* or save a report.
 
 ## Development
 

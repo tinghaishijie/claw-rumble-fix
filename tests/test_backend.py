@@ -1,9 +1,11 @@
 """Backend tests against a fake sysfs tree (no hardware required)."""
 import asyncio
 import os
+import socket
 import struct
 import sys
 import tempfile
+import threading
 import types
 import unittest
 
@@ -89,7 +91,7 @@ class Discovery(Base):
         self.assertTrue(status["controller"]["has_reset"])
         self.assertEqual(status["controller"]["state"]["gamepad_mode"], "xinput")
         self.assertEqual(status["controller"]["state"]["rumble_intensity_left"], "50")
-        self.assertFalse(status["quiet_udev"])
+        self.assertIn("unexpected_acks", status)
 
 
 class McuReset(Base):
@@ -137,9 +139,24 @@ class McuReset(Base):
 
     def test_fix_reports_a_failed_test_pulse(self):
         # No rumble-capable node in the fake tree: the reset works, the pulse cannot.
+        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
         result = main.act_fix_rumble()
         self.assertFalse(result["ok"])
         self.assertIn("MCU reset done", result["msg"])
+        self.assertIn("profile memory not captured", result["msg"])
+        self.assertEqual(len(main.load_fix_records()), 1)
+
+    def test_fix_records_what_the_reset_changed(self):
+        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
+        dumps = iter([(bytes([1, 2, 3, 4]), None), (bytes([1, 9, 9, 4]), None)])
+        saved, main.capture_profile = main.capture_profile, lambda: next(dumps)
+        try:
+            result = main.act_fix_rumble()
+        finally:
+            main.capture_profile = saved
+        self.assertIn("reset changed 1 profile range(s): 0x0001-0x0002", result["msg"])
+        record = main.load_fix_records()[-1]
+        self.assertEqual((record["before"], record["after"]), ("01020304", "01090904"))
 
 
 class Exposure(Base):
@@ -177,105 +194,90 @@ class Diagnostics(Base):
         self.assertIn("name=Fake Pad", report)
         self.assertIn("gamepad_mode = xinput", report)
         self.assertIn("activity trace", report)
-        self.assertIn("udev rules mentioning the controller", report)
+        self.assertIn("MCU profile memory (now)", report)
 
 
-class UdevOverride(Base):
-    V078 = ('ACTION=="add|change|bind", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="190[1-3]", '
-            'SUBSYSTEM=="hid", DRIVER=="hid-msi", ATTR{button_m1}="KEY_RIGHTBRACE", '
-            'ATTR{button_m2}="KEY_LEFTBRACE", GOTO="claw_desktop"')
-    MATCH = ('ACTION=="add|change|bind", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="190[1-3]", '
-             'SUBSYSTEM=="hid", DRIVER=="hid-msi"')
-    NAME = "99-inputplumber-device-setup.rules"
+class FakeMcu(threading.Thread):
+    """Answers READ_PROFILE requests on one end of a datagram socket pair."""
 
+    def __init__(self, sock, memory, silent_at=()):
+        super().__init__(daemon=True)
+        self.sock, self.memory, self.silent_at = sock, memory, set(silent_at)
+        self.requests = []
+
+    def run(self):
+        while True:
+            try:
+                req = self.sock.recv(64)
+            except OSError:
+                return
+            if not req:
+                return
+            addr, length = (req[6] << 8) | req[7], req[8]
+            self.requests.append(addr)
+            if addr in self.silent_at:
+                continue
+            # An unrelated input report first: it must be skipped.
+            self.sock.send(bytes([0x10, 0, 0, 0x3C, 0x06]).ljust(64, b"\0"))
+            self.sock.send((bytes([0x10, 0, 0, 0x3C, 0x05, 0x01, req[6], req[7], length])
+                            + self.memory[addr:addr + length]).ljust(64, b"\0"))
+
+
+class Profile(Base):
     def setUp(self):
         super().setUp()
-        self.saved = (main.RULES_SOURCE_DIR, main.RULES_ETC_DIR, main.RULES_OVERRIDE_DIR,
-                      main._run_cmd)
-        main.RULES_SOURCE_DIR = tempfile.mkdtemp()
-        main.RULES_ETC_DIR = tempfile.mkdtemp()
-        main.RULES_OVERRIDE_DIR = os.path.join(tempfile.mkdtemp(), "rules.d")
-        self.commands = []
-        main._run_cmd = lambda args, timeout=0: (self.commands.append(args), (0, ""))[1]
-        self.source = os.path.join(main.RULES_SOURCE_DIR, self.NAME)
-        self.override = os.path.join(main.RULES_OVERRIDE_DIR, self.NAME)
+        self.memory = bytes((i * 7) & 0xFF for i in range(main.PROFILE_END))
+        self.host, self.device = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
 
     def tearDown(self):
-        (main.RULES_SOURCE_DIR, main.RULES_ETC_DIR, main.RULES_OVERRIDE_DIR,
-         main._run_cmd) = self.saved
+        self.host.close()
+        self.device.close()
         super().tearDown()
 
-    def test_unconditional_writes_become_conditional(self):
-        self.assertEqual(main.soften_rule(self.V078), [
-            self.MATCH + ', ATTR{button_m1}!="KEY_RIGHTBRACE", ATTR{button_m1}="KEY_RIGHTBRACE"',
-            self.MATCH + ', ATTR{button_m2}!="KEY_LEFTBRACE", ATTR{button_m2}="KEY_LEFTBRACE"',
-            self.MATCH + ', GOTO="claw_desktop"',
-        ])
+    def test_request_and_reply_format(self):
+        request = main.profile_request(0x024A, 0x20)
+        self.assertEqual(request[:9], bytes([0x0F, 0, 0, 0x3C, 0x04, 0x01, 0x02, 0x4A, 0x20]))
+        self.assertEqual(len(request), 64)
+        reply = bytes([0x10, 0, 0, 0x3C, 0x05, 0x01, 0x02, 0x4A, 3, 9, 8, 7, 0, 0])
+        self.assertEqual(main.parse_profile_reply(reply, 0x024A), bytes([9, 8, 7]))
+        self.assertIsNone(main.parse_profile_reply(reply, 0x0022))             # other address
+        self.assertIsNone(main.parse_profile_reply(b"\x10\0\0\x3c\x06" + reply[5:], 0x024A))
 
-    def test_existing_conditions_are_kept(self):
-        line = ('ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", '
-                'ATTR{gamepad_mode}="xinput", GOTO="end"')
-        self.assertEqual(main.soften_rule(line), [
-            'ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", '
-            'ATTR{gamepad_mode}!="xinput", ATTR{gamepad_mode}="xinput"',
-            'ACTION=="add", DRIVER=="hid-msi", ATTR{gamepad_mode}=="desktop", GOTO="end"',
-        ])
+    def test_whole_profile_is_read_through_the_fake_mcu(self):
+        mcu = FakeMcu(self.device, self.memory)
+        mcu.start()
+        self.assertEqual(main.read_profile_fd(self.host.fileno(), timeout=1.0), self.memory)
+        self.assertEqual(mcu.requests, list(range(0, main.PROFILE_END, main.PROFILE_CHUNK)))
 
-    def test_unrelated_lines_are_untouched(self):
-        for line in ("# MSI Claw Settings", "", 'LABEL="claw_desktop"',
-                     'ACTION=="add", DRIVER=="asus_rog_ally", ATTR{gamepad_mode}="1"',
-                     'ACTION=="add", DRIVER=="hid-msi", GOTO="end"'):
-            self.assertEqual(main.soften_rule(line), [line])
+    def test_silent_mcu_is_reported_not_hung(self):
+        FakeMcu(self.device, self.memory, silent_at=[0x40]).start()
+        with self.assertRaises(OSError) as caught:
+            main.read_profile_fd(self.host.fileno(), timeout=0.05)
+        self.assertIn("0x0040", str(caught.exception))
 
-    def test_enable_writes_runtime_override_and_reloads(self):
-        put(self.source, "# header\n" + self.V078 + '\nLABEL="claw_desktop"')
-        result = main.act_quiet_udev(True)
-        self.assertTrue(result["ok"], result["msg"])
-        with open(self.override) as f:
-            text = f.read()
-        self.assertIn('ATTR{button_m1}!="KEY_RIGHTBRACE", ATTR{button_m1}="KEY_RIGHTBRACE"', text)
-        self.assertIn('LABEL="claw_desktop"', text)
-        self.assertNotIn(self.V078, text)
-        self.assertEqual(self.commands, [["udevadm", "control", "--reload"]])
-        self.assertTrue(main.build_status()["quiet_udev_active"])
-        self.assertTrue(main.act_quiet_udev(False)["ok"])
-        self.assertFalse(os.path.exists(self.override))
+    def test_diff_reports_ranges(self):
+        new = bytearray(self.memory)
+        new[0x22] ^= 0xFF
+        new[0x23] ^= 0xFF
+        new[0x100] ^= 0x01
+        lines = main.diff_profiles(self.memory, bytes(new))
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("0x0022-0x0023: "))
+        self.assertTrue(lines[1].startswith("0x0100-0x0100: "))
+        self.assertEqual(main.diff_profiles(self.memory, self.memory), [])
 
-    def test_user_override_in_etc_is_respected(self):
-        put(self.source, self.V078)
-        put(os.path.join(main.RULES_ETC_DIR, self.NAME), "# mine")
-        self.assertFalse(main.act_quiet_udev(True)["ok"])
-        self.assertFalse(os.path.exists(self.override))
+    def test_fix_records_are_kept_and_capped(self):
+        decky.DECKY_PLUGIN_SETTINGS_DIR = tempfile.mkdtemp()
+        for index in range(12):
+            main.save_fix_record({"time": str(index), "before": "00", "after": "01", "error": None})
+        records = main.load_fix_records()
+        self.assertEqual(len(records), 10)
+        self.assertEqual(records[-1]["time"], "11")
 
-    def test_any_rule_file_writing_hid_msi_settings_is_overridden(self):
-        put(os.path.join(main.RULES_SOURCE_DIR, "70-vendor-claw.rules"), self.V078)
-        put(os.path.join(main.RULES_SOURCE_DIR, "50-unrelated.rules"), 'KERNEL=="sda", MODE="0660"')
-        result = main.act_quiet_udev(True)
-        self.assertTrue(result["ok"], result["msg"])
-        self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["70-vendor-claw.rules"])
-
-    def test_rules_in_etc_are_reported_as_unhandled(self):
-        put(self.source, self.V078)
-        put(os.path.join(main.RULES_ETC_DIR, "99-custom.rules"), self.V078)
-        result = main.act_quiet_udev(True)
-        self.assertFalse(result["ok"])
-        self.assertIn("NOT handled", result["msg"])
-        self.assertIn("99-custom.rules", result["msg"])
-        self.assertTrue(os.path.exists(self.override))  # the /usr/lib one is still handled
-
-    def test_foreign_files_in_run_are_never_removed(self):
-        foreign = os.path.join(main.RULES_OVERRIDE_DIR, "50-inputplumber-hide.rules")
-        put(foreign, 'KERNEL=="event6", MODE="0000"')
-        put(self.source, self.V078)
-        main.act_quiet_udev(True)
-        main.act_quiet_udev(False)
-        self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["50-inputplumber-hide.rules"])
-
-    def test_missing_or_irrelevant_rule_file_fails_cleanly(self):
-        self.assertFalse(main.act_quiet_udev(True)["ok"])
-        put(self.source, "# nothing for the claw here")
-        self.assertFalse(main.act_quiet_udev(True)["ok"])
-        self.assertFalse(os.path.exists(self.override))
+    def test_capture_failure_never_raises(self):
+        profile, error = main.capture_profile()   # fake tree has no hidraw node
+        self.assertIsNone(profile)
+        self.assertIn("hidraw", error)
 
 
 class ActivityTrace(Base):
@@ -334,6 +336,19 @@ class ActivityTrace(Base):
         self.assertIn("multi_intensity", names)
         self.assertNotIn("report_descriptor", names)
 
+    def test_leftover_udev_overrides_are_removed(self):
+        saved = (main.RULES_OVERRIDE_DIR, main._run_cmd)
+        main.RULES_OVERRIDE_DIR = tempfile.mkdtemp()
+        main._run_cmd = lambda args, timeout=0: (0, "")
+        try:
+            put(os.path.join(main.RULES_OVERRIDE_DIR, "99-x.rules"),
+                "# Generated by Claw Rumble Fix from /usr/lib/...\nrule")
+            put(os.path.join(main.RULES_OVERRIDE_DIR, "50-foreign.rules"), "rule")
+            self.assertEqual(main.remove_old_overrides(), 1)
+            self.assertEqual(os.listdir(main.RULES_OVERRIDE_DIR), ["50-foreign.rules"])
+        finally:
+            main.RULES_OVERRIDE_DIR, main._run_cmd = saved
+
     def test_repeated_entries_are_coalesced(self):
         trace = main.Trace()
         for _ in range(3):
@@ -362,13 +377,13 @@ class Formats(unittest.TestCase):
 class Resume(Base):
     def setUp(self):
         super().setUp()
-        self.saved = (main.WAKE_SETTLE, main.WAKE_WINDOW, main.count_flash_acks)
-        main.WAKE_SETTLE = main.WAKE_WINDOW = 0
+        self.saved = (main.WAKE_WINDOW, main.count_unexpected_acks)
+        main.WAKE_WINDOW = 0
         self.acks = iter([100, 106, 106, 106])
-        main.count_flash_acks = lambda: next(self.acks)
+        main.count_unexpected_acks = lambda: next(self.acks)
 
     def tearDown(self):
-        main.WAKE_SETTLE, main.WAKE_WINDOW, main.count_flash_acks = self.saved
+        main.WAKE_WINDOW, main.count_unexpected_acks = self.saved
         super().tearDown()
 
     def test_wake_is_counted_once_and_only_observed(self):
@@ -378,17 +393,8 @@ class Resume(Base):
 
         asyncio.run(scenario())
         self.assertEqual(main.STATE.resume_count, 1)
-        self.assertEqual(self.writes, [])  # a wake-up never writes to the controller
-        self.assertIn("6 flash commit(s)", main.STATE.last_wake)
-        history = " | ".join(msg for _, msg in main.STATE.history)
-        self.assertIn("controller state mode=xinput mkeys=macro intensity=L50/R50", history)
-
-
-class Settings(Base):
-    def test_obsolete_keys_are_dropped_on_load(self):
-        put(main.settings_path(), '{"auto_level": "mcu", "target_left": 50, "quiet_udev": true}')
-        main.load_settings()
-        self.assertEqual(main.STATE.settings, {"quiet_udev": True})
+        self.assertEqual(self.writes, [])  # a wake-up never touches the controller
+        self.assertIn("6 unexpected MCU ACK(s)", main.STATE.last_wake)
 
 
 if __name__ == "__main__":

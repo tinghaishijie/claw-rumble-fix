@@ -6,12 +6,13 @@ number of suspend/resume cycles on SteamOS. Findings on real hardware:
   * the USB link, the gamepad mode and the stored rumble intensity are all
     intact while rumble is dead; only a controller MCU reset revives it
     (re-sending settings, USB resets and restarting InputPlumber do not);
-  * InputPlumber's udev rule recommits the controller flash several times
-    after every wake-up, which is the suspected trigger.
+  * something else on the system talks to the controller MCU behind the
+    kernel driver's back after every wake-up (seen: the HueSync plugin's raw
+    RGB commands). Whether that is what breaks rumble is not established.
 
-So this backend does three things: it can stop those redundant flash writes,
-it can reset the MCU when rumble is gone, and it records what happens around
-each wake-up so the theory can be checked.
+So this backend resets the MCU on request, records what the reset changed in
+the MCU's profile memory, and keeps a timeline of everything that writes to
+the controller.
 
 Everything here is Python 3.9 compatible and uses the standard library only.
 """
@@ -23,6 +24,7 @@ import glob
 import json
 import os
 import re
+import select
 import shutil
 import stat
 import struct
@@ -46,25 +48,16 @@ EVIOCRMFF = 0x40044581    # _IOW('E', 0x81, int)
 EV_FF = 0x15
 FF_RUMBLE = 0x50
 
-DEFAULT_SETTINGS = {
-    # Stop InputPlumber's udev rule from rewriting unchanged settings into the
-    # controller flash on every device event.
-    "quiet_udev": False,
-}
-# Seconds to let the controller settle after a wake-up before reading it.
-WAKE_SETTLE = 3.0
-# Window after a wake-up in which flash commits are counted.
+# Window after a wake-up in which unexpected MCU ACKs are counted.
 WAKE_WINDOW = 45.0
 
 
 class State:
     def __init__(self):
-        self.settings = dict(DEFAULT_SETTINGS)
         self.history = collections.deque(maxlen=300)
         self.resume_count = 0
         self.last_handled = -1e9
         self.last_wake = None
-        self.quiet_msg = None
         self.lock = None
         self.watch_task = None
 
@@ -311,12 +304,151 @@ def act_mcu_reset():
 
 
 def act_fix_rumble():
-    """MCU reset followed by a test pulse so the result can be felt."""
+    """MCU reset followed by a test pulse so the result can be felt.
+
+    The MCU profile memory is captured before and after: if the reset repairs
+    rumble by reloading that memory from flash, the difference shows which
+    bytes were wrong.
+    """
+    before, before_error = capture_profile()
     reset = act_mcu_reset()
     if not reset["ok"]:
         return reset
+    after, after_error = capture_profile()
+    record = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+              "before": before.hex() if before else None,
+              "after": after.hex() if after else None,
+              "error": before_error or after_error}
+    save_fix_record(record)
+    if before and after:
+        ranges = diff_profiles(before, after)
+        note = ("profile memory unchanged by the reset" if not ranges else
+                "reset changed %d profile range(s): %s"
+                % (len(ranges), ", ".join(r.split(":")[0] for r in ranges[:6])))
+        for line in ranges:
+            _log("profile diff " + line)
+    else:
+        note = "profile memory not captured (%s)" % (before_error or after_error)
     pulse = act_test_rumble()
-    return _res(pulse["ok"], "%s; %s" % (reset["msg"], pulse["msg"]), changed=True)
+    return _res(pulse["ok"], "%s; %s; %s" % (reset["msg"], note, pulse["msg"]), changed=True)
+
+
+# --------------------------------------------------------------------------
+# MCU profile memory
+# --------------------------------------------------------------------------
+#
+# The MCU keeps its configuration (button mappings, rumble intensity, RGB
+# frames, ...) in a "profile" that the kernel driver reads and writes in
+# small pieces. Reading it does not change anything. The request is
+#   0f 00 00 3c 04 <profile> <addr hi> <addr lo> <length>
+# and the reply, on the same interface,
+#   10 00 00 3c 05 <profile> <addr hi> <addr lo> <length> <data...>
+
+PROFILE_ID = 0x01
+PROFILE_END = 0x0340      # past the last RGB frame (0x024a + 8 frames)
+PROFILE_CHUNK = 0x20
+PACKET_SIZE = 64
+
+
+def profile_request(addr, length):
+    return bytes([0x0F, 0x00, 0x00, 0x3C, 0x04, PROFILE_ID,
+                  (addr >> 8) & 0xFF, addr & 0xFF, length]).ljust(PACKET_SIZE, b"\0")
+
+
+def parse_profile_reply(report, addr):
+    """Payload of a READ_PROFILE reply for addr, or None for any other report."""
+    if (len(report) < 9 or report[0] != 0x10 or report[3] != 0x3C or report[4] != 0x05
+            or report[5] != PROFILE_ID or report[6] != (addr >> 8) & 0xFF
+            or report[7] != addr & 0xFF):
+        return None
+    return bytes(report[9:9 + report[8]])
+
+
+def read_profile_fd(fd, end=PROFILE_END, timeout=0.3):
+    """Read profile memory [0, end) through an open hidraw fd."""
+    while select.select([fd], [], [], 0)[0]:   # drop stale input reports
+        os.read(fd, PACKET_SIZE)
+    data = bytearray()
+    for addr in range(0, end, PROFILE_CHUNK):
+        chunk = None
+        for _attempt in range(2):
+            os.write(fd, profile_request(addr, PROFILE_CHUNK))
+            deadline = time.monotonic() + timeout
+            while chunk is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                    break
+                chunk = parse_profile_reply(os.read(fd, PACKET_SIZE), addr)
+            if chunk is not None:
+                break
+        if chunk is None or len(chunk) != PROFILE_CHUNK:
+            raise OSError("no valid reply for profile address 0x%04x" % addr)
+        data.extend(chunk)
+    return bytes(data)
+
+
+def capture_profile():
+    """(profile bytes, None) or (None, reason). Never raises."""
+    try:
+        ctrl = find_controller()
+        if not ctrl or not ctrl["cfg"]:
+            return None, "controller config interface not found"
+        nodes = sorted(glob.glob(os.path.join(ctrl["cfg"], "hidraw/hidraw*")))
+        if not nodes:
+            return None, "no hidraw node for the config interface"
+        fd = _open_chardev(nodes[0], os.O_RDWR | os.O_NONBLOCK)
+        try:
+            return read_profile_fd(fd), None
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
+
+
+def diff_profiles(old, new):
+    """Differing byte ranges as 'start-end: old -> new' lines."""
+    lines, start = [], None
+    length = min(len(old), len(new))
+    for index in range(length + 1):
+        differs = index < length and old[index] != new[index]
+        if differs and start is None:
+            start = index
+        elif not differs and start is not None:
+            a, b = old[start:index], new[start:index]
+            cut_at = 24
+            lines.append("0x%04x-0x%04x: %s%s -> %s%s" % (
+                start, index - 1, a[:cut_at].hex(" "), " ..." if len(a) > cut_at else "",
+                b[:cut_at].hex(" "), " ..." if len(b) > cut_at else ""))
+            start = None
+    return lines
+
+
+def hexdump(data):
+    return "\n".join("%04x  %s" % (offset, data[offset:offset + 16].hex(" "))
+                     for offset in range(0, len(data), 16))
+
+
+def fix_record_path():
+    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "fix-records.json")
+
+
+def load_fix_records():
+    try:
+        with open(fix_record_path(), "r", encoding="utf-8") as f:
+            records = json.load(f)
+        return records if isinstance(records, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_fix_record(record):
+    records = (load_fix_records() + [record])[-10:]
+    try:
+        os.makedirs(os.path.dirname(fix_record_path()), exist_ok=True)
+        with open(fix_record_path(), "w", encoding="utf-8") as f:
+            json.dump(records, f)
+    except OSError as exc:
+        decky.logger.error("failed to save fix record: %s" % exc)
 
 
 def _has_ff_rumble(event_node):
@@ -379,132 +511,34 @@ def act_test_rumble(seconds=0.6):
 
 
 # --------------------------------------------------------------------------
-# Redundant controller flash writes
+# Kernel log
 # --------------------------------------------------------------------------
-#
-# InputPlumber ships a udev rule that assigns button_m1/button_m2 (and, in
-# newer versions, mkeys_function) on every add/change/bind event of the
-# hid-msi device. Each assignment makes the kernel commit the controller's
-# flash, even when the value is already set. On an affected Claw A8 this
-# happened several times after every wake-up; the kernel logs one
-# "Got unexpected ACK from MCU" per commit.
-#
-# The override below is a copy of that rule file in /run (which takes
-# precedence over /usr/lib and vanishes on reboot) where every assignment
-# only fires when the attribute differs from the wanted value.
 
-RULES_SOURCE_DIR = "/usr/lib/udev/rules.d"
-RULES_ETC_DIR = "/etc/udev/rules.d"
 RULES_OVERRIDE_DIR = "/run/udev/rules.d"
 OVERRIDE_TAG = "Generated by Claw Rumble Fix"
-OVERRIDE_MARK = "# " + OVERRIDE_TAG + " from %s. Do not edit; removed on reboot."
 ACK_MESSAGE = "unexpected ACK from MCU"
 
 
-def split_rule(line):
-    """Split a udev rule into its comma separated keys, honouring quotes."""
-    tokens, current, quoted = [], "", False
-    for char in line:
-        if char == '"':
-            quoted = not quoted
-        if char == "," and not quoted:
-            tokens.append(current.strip())
-            current = ""
-        else:
-            current += char
-    if current.strip():
-        tokens.append(current.strip())
-    return tokens
+def remove_old_overrides():
+    """Remove udev overrides left by versions before 0.5 (they had no effect)."""
+    removed = 0
+    for path in glob.glob(os.path.join(RULES_OVERRIDE_DIR, "*.rules")):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                ours = OVERRIDE_TAG in f.readline()
+            if ours:
+                os.unlink(path)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        _run_cmd(["udevadm", "control", "--reload"], 15)
+    return removed
 
 
-def soften_rule(line):
-    """Turn unconditional ATTR assignments of a hid-msi rule into conditional ones."""
-    text = line.strip()
-    if (not text or text.startswith("#") or text.endswith("\\")
-            or 'DRIVER=="hid-msi"' not in text):
-        return [line]
-    tokens = split_rule(text)
-    assigns = [re.match(r'^ATTR\{([\w/]+)\}="([^"]*)"$', token) for token in tokens]
-    if not any(assigns):
-        return [line]
-    matches = [t for t, a in zip(tokens, assigns) if not a and re.search(r"[=!]=", t)]
-    others = [t for t, a in zip(tokens, assigns) if not a and not re.search(r"[=!]=", t)]
-    out = []
-    for assign in assigns:
-        if assign:
-            name, value = assign.groups()
-            out.append(", ".join(matches + ['ATTR{%s}!="%s"' % (name, value),
-                                            'ATTR{%s}="%s"' % (name, value)]))
-    if others:
-        out.append(", ".join(matches + others))
-    return out
-
-
-def _rule_lines(path):
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read().splitlines()
-    except OSError:
-        return []
-
-
-def hid_msi_rule_files(directory):
-    """Rule files in a directory that assign hid-msi attributes unconditionally."""
-    found = []
-    for path in sorted(glob.glob(os.path.join(directory, "*.rules"))):
-        lines = _rule_lines(path)
-        if lines and OVERRIDE_TAG in lines[0]:
-            continue
-        if any(soften_rule(line) != [line] for line in lines):
-            found.append((path, lines))
-    return found
-
-
-def our_overrides():
-    return [path for path in sorted(glob.glob(os.path.join(RULES_OVERRIDE_DIR, "*.rules")))
-            if OVERRIDE_TAG in "".join(_rule_lines(path)[:1])]
-
-
-def act_quiet_udev(enable):
-    try:
-        removed = our_overrides()
-        for path in removed:
-            os.unlink(path)
-        if not enable:
-            if removed:
-                _run_cmd(["udevadm", "control", "--reload"], 15)
-            return _res(True, "original udev rules restored", changed=bool(removed))
-        written, softened_rules = [], 0
-        for source, lines in hid_msi_rule_files(RULES_SOURCE_DIR):
-            name = os.path.basename(source)
-            if os.path.exists(os.path.join(RULES_ETC_DIR, name)):
-                continue  # /etc wins over /run; reported below if it matters
-            out = [OVERRIDE_MARK % source]
-            for line in lines:
-                new = soften_rule(line)
-                softened_rules += new != [line]
-                out.extend(new)
-            os.makedirs(RULES_OVERRIDE_DIR, exist_ok=True)
-            with open(os.path.join(RULES_OVERRIDE_DIR, name), "w", encoding="utf-8") as f:
-                f.write("\n".join(out) + "\n")
-            written.append(name)
-    except OSError as exc:
-        return _res(False, "udev override failed: %s" % exc)
-    # Rules in /etc cannot be overridden from /run.
-    unhandled = [os.path.basename(path) for path, _ in hid_msi_rule_files(RULES_ETC_DIR)]
-    note = ("; NOT handled (in %s): %s" % (RULES_ETC_DIR, ", ".join(unhandled))
-            if unhandled else "")
-    if not written:
-        return _res(False, "no rule in %s writes hid-msi settings%s" % (RULES_SOURCE_DIR, note))
-    code, out = _run_cmd(["udevadm", "control", "--reload"], 15)
-    if code != 0:
-        return _res(False, "udev override written, reload failed: %s" % out, changed=True)
-    return _res(not unhandled, "udev override active for %s (%d rule(s) made conditional)%s"
-                % (", ".join(written), softened_rules, note), changed=True)
-
-
-def count_flash_acks():
-    """Controller flash commits the kernel has logged since boot (None if unknown)."""
+def count_unexpected_acks():
+    """'unexpected ACK' lines since boot: commands sent to the MCU behind the
+    kernel driver's back, plus the driver's own flash commits (None if unknown)."""
     code, out = _run_cmd(["dmesg"], 15)
     if code != 0:
         return None
@@ -582,7 +616,12 @@ def describe_pid(pid):
 
 
 def trace_targets(ctrl):
-    """Writable sysfs attributes of the controller's config and LED devices."""
+    """Writable sysfs attributes of the controller's config and LED devices.
+
+    Raw commands sent through /dev/hidraw* cannot be watched this way: the
+    kernel delivers no fanotify events for character devices. Those show up
+    as "unexpected ACK" lines from hid-msi instead.
+    """
     if not ctrl or not ctrl["cfg"]:
         return set()
     targets = set()
@@ -799,12 +838,9 @@ def build_status():
         "inputplumber": inputplumber_state(),
         "kernel": os.uname().release,
         "root": os.geteuid() == 0,
-        "quiet_udev": bool(STATE.settings["quiet_udev"]),
-        "quiet_udev_active": bool(our_overrides()),
-        "quiet_udev_msg": STATE.quiet_msg,
         "writers": TRACE.top_writers(),
         "trace_notes": list(TRACE.notes),
-        "flash_acks": count_flash_acks(),
+        "unexpected_acks": count_unexpected_acks(),
         "resume_count": STATE.resume_count,
         "last_wake": STATE.last_wake,
         "history": ["%s  %s" % (t[11:], m) for t, m in list(STATE.history)[-8:]],
@@ -871,15 +907,22 @@ def write_diagnostics():
                                            "/etc/inputplumber/devices.d/*; do echo \"## $f\"; "
                                            "cat \"$f\"; done 2>&1 | head -n 400"])):
         section(title, _run_cmd(args, 15)[1])
+    profile, error = capture_profile()
+    records = load_fix_records()
+    section("MCU profile memory (now)", hexdump(profile) if profile else "not captured: %s" % error)
+    healthy = next((bytes.fromhex(r["after"]) for r in reversed(records) if r.get("after")), None)
+    if profile and healthy:
+        section("profile: now vs. right after the last MCU reset",
+                "\n".join(diff_profiles(healthy, profile)) or "identical")
+    for record in records:
+        if record.get("before") and record.get("after"):
+            body = "\n".join(diff_profiles(bytes.fromhex(record["before"]),
+                                           bytes.fromhex(record["after"]))) or "identical"
+        else:
+            body = "not captured: %s" % record.get("error")
+        section("MCU reset at %s: profile before -> after" % record.get("time"), body)
     section("controller writers since plugin start", "\n".join(TRACE.top_writers(40)))
     section("activity trace", "\n".join(TRACE.lines()))
-    for directory in (RULES_SOURCE_DIR, RULES_ETC_DIR, RULES_OVERRIDE_DIR):
-        dump = []
-        for path in sorted(glob.glob(os.path.join(directory, "*.rules"))):
-            lines = _rule_lines(path)
-            if any("hid-msi" in line or "0db0" in line.lower() for line in lines):
-                dump.append("## %s\n%s" % (path, "\n".join(lines[:80])))
-        section("udev rules mentioning the controller in %s" % directory, "\n\n".join(dump))
     section("decky plugins", _run_cmd(["ls", "-1", os.path.join(decky.DECKY_HOME, "plugins")], 5)[1])
     _, dmesg = _run_cmd(["dmesg"], 20)
     pattern = re.compile(r"hid-msi|msi|0db0|xpad|usb \d|xhci|PM: |suspend|resume|inputplumber",
@@ -900,34 +943,6 @@ def write_diagnostics():
     except (OSError, LookupError):
         pass
     return path
-
-
-# --------------------------------------------------------------------------
-# Settings
-# --------------------------------------------------------------------------
-
-def settings_path():
-    return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
-
-
-def load_settings():
-    settings = dict(DEFAULT_SETTINGS)
-    try:
-        with open(settings_path(), "r", encoding="utf-8") as f:
-            stored = json.load(f)
-        settings.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
-    except (OSError, ValueError):
-        pass
-    STATE.settings = settings
-
-
-def save_settings():
-    try:
-        os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
-        with open(settings_path(), "w", encoding="utf-8") as f:
-            json.dump(STATE.settings, f, indent=2)
-    except OSError as exc:
-        decky.logger.error("failed to save settings: %s" % exc)
 
 
 # --------------------------------------------------------------------------
@@ -970,16 +985,12 @@ async def _handle_resume(source, slept):
     count = STATE.resume_count
     _log("wake #%d detected via %s%s" % (
         count, source, "" if slept is None else " (slept %.0fs)" % slept))
-    before = await asyncio.to_thread(count_flash_acks)
-    await asyncio.sleep(WAKE_SETTLE)
-    ctrl = await _locked(find_controller)
-    if ctrl and ctrl["cfg"]:
-        state = await _locked(read_mcu_state, ctrl["cfg"])
-        _log("wake #%d: controller state %s" % (count, describe_state(state)))
-    await asyncio.sleep(max(0.0, WAKE_WINDOW - WAKE_SETTLE))
-    after = await asyncio.to_thread(count_flash_acks)
+    # Deliberately no controller access here: a wake-up is only observed.
+    before = await asyncio.to_thread(count_unexpected_acks)
+    await asyncio.sleep(WAKE_WINDOW)
+    after = await asyncio.to_thread(count_unexpected_acks)
     if before is not None and after is not None:
-        STATE.last_wake = "wake #%d: %d flash commit(s) in the first %ds" % (
+        STATE.last_wake = "wake #%d: %d unexpected MCU ACK(s) in the first %ds" % (
             count, after - before, WAKE_WINDOW)
         _log(STATE.last_wake)
 
@@ -1003,15 +1014,12 @@ async def watch_resume():
 
 class Plugin:
     async def _main(self):
-        load_settings()
-        _log("plugin started, redundant flash writes %s"
-             % ("blocked" if STATE.settings["quiet_udev"] else "not blocked"))
+        _log("plugin started")
         TRACE.start(asyncio.get_event_loop())
         STATE.watch_task = asyncio.ensure_future(watch_resume())
-        if STATE.settings["quiet_udev"]:
-            result = await _locked(act_quiet_udev, True)
-            STATE.quiet_msg = result["msg"]
-            _log("startup udev override: %s" % result["msg"])
+        removed = await _locked(remove_old_overrides)
+        if removed:
+            _log("removed %d udev override(s) left by an older version" % removed)
 
     async def _unload(self):
         if STATE.watch_task:
@@ -1037,14 +1045,6 @@ class Plugin:
     async def test_rumble(self):
         result = await _locked(act_test_rumble)
         _log("test rumble: %s" % result["msg"])
-        return result
-
-    async def set_quiet_udev(self, enable):
-        STATE.settings["quiet_udev"] = bool(enable)
-        save_settings()
-        result = await _locked(act_quiet_udev, bool(enable))
-        STATE.quiet_msg = result["msg"] if enable else None
-        _log("udev override %s: %s" % ("on" if enable else "off", result["msg"]))
         return result
 
     async def save_diagnostics(self):
