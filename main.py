@@ -9,6 +9,9 @@ The fix button also records the controller state right before and right
 after the reset. The "before" record is taken while rumble is still broken,
 which is the evidence needed to find the actual cause.
 
+The controller can also be switched between its XInput and DInput modes, to
+find out whether the rumble loss depends on the mode.
+
 Python 3.9 compatible, standard library only.
 """
 import asyncio
@@ -595,6 +598,45 @@ def _mcu_reset(ctrl, path, before):
     return _res(True, "MCU reset done" + ("; " + "; ".join(notes) if notes else ""))
 
 
+def set_gamepad_mode(mode):
+    """Switch the controller between XInput and DInput; it re-enumerates on USB."""
+    if mode not in SWITCHABLE_MODES:
+        return _res(False, "unknown gamepad mode '%s'" % mode)
+    ctrl = find_controller()
+    if not ctrl:
+        return _res(False, "controller not found on USB")
+    if not ctrl["cfg"]:
+        return _res(False, "kernel driver exposes no gamepad_mode attribute")
+    keep_hidden = not pad_exposed(ctrl) and inputplumber_active()
+    if keep_hidden:
+        set_hide_rules(True)
+    try:
+        try:
+            _write(os.path.join(ctrl["cfg"], "gamepad_mode"), mode)
+        except OSError as exc:
+            return _res(False, "gamepad_mode write failed: %s" % exc)
+        wait_reenumerated(ctrl["devnum"], 8.0)
+        back = wait_cfg()
+        time.sleep(0.5)
+        try:
+            now = _read(os.path.join(back["cfg"], "gamepad_mode"))
+        except (OSError, TypeError):
+            now = None
+        if now != mode:
+            return _res(False, "controller reports mode '%s' after switching to '%s'"
+                        % (now, mode))
+        result = _res(True, "gamepad mode is now '%s'" % mode)
+        if keep_hidden and not wait_inputplumber_rehide():
+            current = find_controller()
+            if current and pad_exposed(current):
+                result["msg"] += ("; the physical pad is visible, Steam may list an extra "
+                                  "controller until reboot")
+        return result
+    finally:
+        if keep_hidden:
+            set_hide_rules(False)
+
+
 def fix_rumble():
     """Capture the broken state, reset the MCU, capture again (ends with a pulse)."""
     folder = new_capture_folder()
@@ -614,6 +656,7 @@ def build_status():
     return {
         "controller": None if not ctrl else {
             "pid_mode": ctrl["pid_mode"], "bcd": ctrl["bcd"],
+            "can_switch": bool(ctrl["cfg"]),
             "can_reset": bool(ctrl["cfg"]) and os.path.exists(os.path.join(ctrl["cfg"], "reset")),
         },
         "last_result": STATE.last_result,
@@ -659,6 +702,14 @@ class Plugin:
 
     async def get_status(self):
         return await _locked(build_status)
+
+    async def set_mode(self, mode):
+        try:
+            result = await _locked(set_gamepad_mode, mode)
+        except Exception as exc:
+            result = _res(False, "mode switch failed: %r" % exc)
+        _log("set mode %s: %s" % (mode, result["msg"]))
+        return result
 
     async def fix(self):
         try:

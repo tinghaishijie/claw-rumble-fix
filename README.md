@@ -5,7 +5,7 @@ A [Decky Loader](https://decky.xyz) plugin for the **MSI Claw A8** (board
 cycle: buttons and sticks keep working, the motors stay silent.
 
 The cause is not known yet. Resetting the controller MCU brings rumble back,
-so the plugin has one button that does exactly that.
+so the plugin's main button does exactly that.
 
 ## Fix rumble
 
@@ -22,6 +22,21 @@ While the controller reconnects, the plugin keeps the physical pad hidden
 with two temporary udev rules in `/run/udev/rules.d`, so Steam does not pick
 it up as an extra "Xbox 360 Controller". The rules are removed once
 InputPlumber has hidden the pad again.
+
+## Gamepad mode
+
+The controller has an XInput and a DInput mode. The panel shows the current
+one and a button to switch to the other; the controller reconnects for a few
+seconds. This is there to find out whether the rumble loss depends on the
+mode.
+
+In DInput mode the buttons and sticks work, but games cannot rumble on
+SteamOS: the DInput device has no force feedback in the kernel and
+InputPlumber has no other rumble path for it. The plugin's own pulse at the
+end of a fix still works there, because it writes the DInput rumble report
+directly.
+
+Whether the mode survives a reboot has not been checked.
 
 ## Captures
 

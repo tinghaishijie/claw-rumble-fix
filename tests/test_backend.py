@@ -176,6 +176,58 @@ class McuReset(Base):
         self.assertIn("extra Xbox 360 controller", result["msg"])
 
 
+class ModeSwitch(Base):
+    def setUp(self):
+        super().setUp()
+        self._saved = (main.wait_reenumerated, main.inputplumber_active, main._run_cmd,
+                       main.RULES_DIR)
+        main.wait_reenumerated = lambda devnum, timeout=0: main.find_controller()
+        main.inputplumber_active = lambda: False
+        main._run_cmd = lambda args, timeout=20: (0, "")
+        main.RULES_DIR = tempfile.mkdtemp()
+
+    def tearDown(self):
+        (main.wait_reenumerated, main.inputplumber_active, main._run_cmd,
+         main.RULES_DIR) = self._saved
+        super().tearDown()
+
+    def test_switch_writes_the_mode_and_confirms_it(self):
+        result = main.set_gamepad_mode("dinput")
+        self.assertTrue(result["ok"], result["msg"])
+        self.assertEqual(self.attr("gamepad_mode"), "dinput")
+        self.assertEqual(self.writes, [(os.path.relpath(
+            os.path.join(self.cfg, "gamepad_mode"), self.sys), "dinput")])
+
+    def test_unknown_mode_is_rejected_without_a_write(self):
+        self.assertFalse(main.set_gamepad_mode("desktop")["ok"])
+        self.assertEqual(self.writes, [])
+
+    def test_mode_that_did_not_stick_is_a_failure(self):
+        base_write = main._write
+        main._write = lambda path, value: base_write(path, "xinput")  # MCU ignores it
+        result = main.set_gamepad_mode("dinput")
+        self.assertFalse(result["ok"])
+        self.assertIn("reports mode 'xinput'", result["msg"])
+
+    def test_hidden_pad_stays_hidden_during_the_switch(self):
+        main.DEV = tempfile.mkdtemp()
+        event = os.path.join(self.usb, "3-3:1.0/input/input20/event7")
+        put(os.path.join(event, "device/capabilities/abs"), "3003f")
+        node = os.path.join(main.DEV, "input/event7")
+        put(node, "")
+        os.chmod(node, 0)
+        put(os.path.join(main.RULES_DIR, "50-inputplumber-hide-event7-early.rules"),
+            'KERNELS=="input20"')
+        main.inputplumber_active = lambda: True
+        seen = []
+        main.wait_reenumerated = lambda devnum, timeout=0: (
+            seen.append(sorted(n for n in os.listdir(main.RULES_DIR) if "claw" in n)),
+            main.find_controller())[1]
+        self.assertTrue(main.set_gamepad_mode("dinput")["ok"])
+        self.assertEqual(seen, [sorted(main.HIDE_RULES)])
+        self.assertEqual([n for n in os.listdir(main.RULES_DIR) if "claw" in n], [])
+
+
 class Capture(Base):
     def test_fix_captures_before_and_after_even_without_hardware_access(self):
         # No usbmon, hidraw or EC here: every probe fails, the fix still runs
